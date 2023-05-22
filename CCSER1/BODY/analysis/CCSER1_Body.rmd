@@ -22,12 +22,15 @@ CCSER1_S indicates a nonsense mutation (STOP codon) in the gene, and CCSER1_M in
 ### Raw counts and annotation
 Must delete the first column's name in the txt count data to ensure we import gene names as rownames.
 ```{r}
-library(BiocManager)
-library(biomaRt) #biocmanager install
-library(DESeq2) #biocmanager install.  
-library(GenomicFeatures) #biocmanager install.  
+suppressPackageStartupMessages({
+  library(BiocManager)
+  library(biomaRt) #biocmanager install
+  library(DESeq2) #biocmanager install.  
+  library(GenomicFeatures) #biocmanager install.  
+})
 
-body = read.delim("rawCounts_Body copy.txt", sep = "")
+
+body = read.delim("rawCounts_Body.txt", sep = "")
 
 #exclude any rows where no counts were found for any condition
 body = body[rowSums(body) > 0, ]

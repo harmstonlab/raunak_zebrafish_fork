@@ -1,0 +1,1688 @@
+---
+title: "CCSER1_Body"
+author: "Raunak Vijayakar"
+date: "dd/mm/yyyy"
+output: 
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+From a prior PCA plot, it seems largest variation is between BODY and NON-BODY (BRAIN) samples. All comparisons appear to be within those two groups though, not between. There is some expectation that the effect of CCSER1 knockout in the brain is different from the body. Because the two sets represent different tissues, I will analyze them separately. Otherwise, variation due to cell type would confound any effect due to CCSER1.
+BODY appears to have more variance along PC2 than BRAIN, so I will start there.
+From the z11_sampleSheet it looks like there are six replicates for all the BRAIN conditions.
+CCSER1_S indicates a nonsense mutation (STOP codon) in the gene, and CCSER1_M indicates a missense (different amino acid) mutation in the gene.
+
+## Body
+
+### Raw counts and annotation
+Must delete the first column's name in the txt count data to ensure we import gene names as rownames.
+```{r}
+suppressPackageStartupMessages({
+  library(BiocManager)
+  library(biomaRt) #biocmanager install
+  library(DESeq2) #biocmanager install.  
+  library(GenomicFeatures) #biocmanager install.  
+})
+
+
+body = read.delim("rawCounts_Body.txt", sep = "")
+
+#exclude any rows where no counts were found for any condition
+body = body[rowSums(body) > 0, ]
+
+#take a look at the reads for each condition
+barplot(colSums(body), ylab="Number of aligned reads", las=2, cex.names=0.8)
+#numbers are similar across all samples
+
+
+#get matching annotations
+dr.gtf.db <- makeTxDbFromGFF("Danio_rerio.GRCz11.102.chr.gtf", format="gtf")
+ensembl.genes = genes(dr.gtf.db)
+fish = useEnsembl(biomart="ENSEMBL_MART_ENSEMBL", host = "asia.ensembl.org", dataset="drerio_gene_ensembl", version = "102") #change host as needed
+head(listAttributes(fish))#annotations we can request
+
+bm.annotations = getBM(attributes=c("ensembl_gene_id", "entrezgene_id", "gene_biotype", "description", "zfin_id_symbol"), mart=fish, filters="ensembl_gene_id", values=ensembl.genes$gene_id, uniqueRows=TRUE)
+
+ensembl.genes$zfin_id_symbol = bm.annotations$zfin_id_symbol[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ensembl.genes$gene_biotype = bm.annotations$gene_biotype[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ensembl.genes$status = bm.annotations$status[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ensembl.genes$description = bm.annotations$description[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ensembl.genes$entrezgene_id = bm.annotations$entrezgene_id[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+```
+
+After reading in the quantified data as read counts, filter out any genes that are not expressed in any sample.Check the read depth of each sample with a barplot. Read depth is quite consistent in this data. Find annotations corresponding to each gene.
+
+
+
+### DDS and Filtering
+
+```{r}
+#see how many reads are in rRNA/mtRNA
+rrna = names(ensembl.genes[ensembl.genes$gene_biotype %in% c("Mt_rRNA", "rRNA" )])
+total.rrna = colSums(body[row.names(body) %in% rrna,])
+barplot(100 * (total.rrna / colSums(body)), ylab="%rRNA/mtRNA", las=2, cex.names=0.8)
+
+#how many reads are in mitochondrial chromosome?
+chrM = names(ensembl.genes[ensembl.genes@seqnames %in% "MT", ])
+total.mchrom = colSums(body[row.names(body) %in% chrM,])
+barplot(100 * (total.mchrom / colSums(body)), ylab="%MT", las=2, cex.names=0.8)
+
+
+#remove rRNA and mtRNA
+body = body[!(row.names(body) %in% rrna),]
+# #remove mitochondrial chromosome reads
+# body = body[!(row.names(body) %in% chrM),]
+body[row.names(body) %in% "ENSDARG00000080031",]
+
+met = read.csv("body_metadata.csv") #sample ids and conditions. no batch indicator, so we won't be controlling for that.
+
+dds = DESeqDataSetFromMatrix(body, met, ~ condition)
+
+dds
+
+dds <- estimateSizeFactors(dds)
+dds <- estimateDispersions(dds) #this helps us deal w/fact that we don't have 30 samples/condition
+
+#normalize for read depth
+head(counts(dds))
+head(counts(dds, normalized=TRUE)) #can do this because we called sizefactors b/f, these number can be compared directly, across condition, not across gene though
+
+#only choosing genes that have a normalized mean expression across conditions >= 10. This removes lowly expressed genes that are hard to differentiate from noise. could also be done after examining p-value histogram of a significance test, comparing pre- and post-filtering.
+filter = apply(counts(dds, normalized=TRUE), 1, function(x){ mean(x) >= 10 })
+dds = dds[filter, ]
+#19722 genes after filtering
+
+#apply regularized log transform. 
+rld <- rlog(dds)
+
+
+
+
+
+
+```
+
+Check for rRNA, and mt rRNA. Ideally these reads will be filtered out during the sequencing process (using ribozero, etc.). The barplots show that the sequencing is already well depleted for both of these sources of noise, as the percentages for both are low. Regardless, remove any genes annotated to be either rRNA, or mtRNA. Filter out genes that are lowly expressed (mean expression < 10), and apply a regularized log transform for PCA, normalizing for library size and putting the count data on a log2 scale.
+
+### Annotation issue [NOTE]
+``` {r}
+nrow(body)-sum(ensembl.genes$gene_id %in% rownames(body))
+
+```
+
+Somehow, some of the genes in the actual data are not in the annotation. The annotation is constructed from a GTF file. The most up to date version is 104, which I'm using (and which I used in my alignments). But CCSER1 data was aligned before, and it turns out they used version 102. Also, when I perform the same check on SMCHD1 data, there is no difference (i.e. all genes are found in the annotation). So that version difference looks to be the culprit.
+
+UPDATE: Now it's running with the 102 gtf, and I still get the same issue. So I guess it's something else.
+
+### PCA
+``` {r}
+#do PCA
+plotPCA(rld, intgroup = c( "condition"))
+plotPCA(rld, intgroup = c( "sample_id"))
+#separates the conditions from each other, which is what we hope. There's large variance between replicates, but that's okay since the replicates cross conditions.
+
+
+```
+Perform PCA to both visualize the high dimensional RNASeq data, and to see is samples are well separated. Much of the data variation can be explained by the expected biological variation between samples, as seen in the plots above. Samples are well separated along PC1, and cluster together well on that axis. On PC1 we can differentiate WT and CCSER1_x samples, and on PC2 we can differentiate all samples. 
+
+### Differential expression analysis
+```{r}
+#all_cond
+#since condition is the only contrast, reduced model won't be controlling for sex, batch, etc.
+nb = nbinomLRT(dds, full = design(dds), reduced = ~1)
+all_cond = results(nb)
+hist(all_cond$pvalue)
+#though the listed foldchange is calculated for some pair of conditions, the p-value from nbinomlrt is for all conditions.
+
+sum(is.na(all_cond$padj)) #3 genes have NA p-values and padj
+#all_cond[is.na(all_cond$padj),] #interesting that 2 are interferon involved (ifi/ifit). One is a lincRNA.
+
+#explanation from DESeq2 vignette:
+# If a row contains a sample with an extreme count outlier then the p value and adjusted p value will be set to NA. These outlier counts are detected by Cook’s distance.
+
+#For now I will remove these genes and move on, but they might deserve another look
+all_cond = all_cond[!is.na(all_cond$padj),]
+
+#significance level of 0.01 for FDR. this is a cutoff for the expected false positive rate (proportion of DEGs that were false to total DEGs). since we have a lot of genes, this seems like a reasonable alpha.
+sum(all_cond$padj < 0.01)
+
+#S_vs_WT
+S_vs_WT = results(nb, contrast=c("condition", "CCSER1_S", "WT"), independentFiltering = TRUE, alpha=0.1, test="Wald")
+hist(S_vs_WT$pvalue) #check this to ensure there isn't batch effect, and that we filtered out the low read genes. Though we can't control for batch in this case.
+S_vs_WT = S_vs_WT[!is.na(S_vs_WT$padj),] #remove NAs
+sum(S_vs_WT$padj < 0.01)
+
+
+#M_vs_WT
+M_vs_WT = results(nb, contrast=c("condition", "CCSER1_M", "WT"), independentFiltering = TRUE, alpha=0.1, test="Wald")
+hist(M_vs_WT$pvalue)
+M_vs_WT = M_vs_WT[!is.na(M_vs_WT$padj),] #remove NAs
+sum(M_vs_WT$padj < 0.01)
+
+
+#Would it make sense to also compare pairwise between the mutants? Possibly.
+M_vs_S = results(nb, contrast=c("condition", "CCSER1_M", "CCSER1_S"), independentFiltering = TRUE, alpha=0.1, test="Wald")
+hist(M_vs_S$pvalue)
+M_vs_S = M_vs_S[!is.na(M_vs_S$padj),] #remove NAs
+sum(M_vs_S$padj < 0.01)
+
+```
+
+
+To compare expression across all conditions, use the negative binomial likelihood ratio test (nbinomLRT). This is analogous to ANOVA, and allows the comparison of more than two groups. For the pairwise comparisons, a Wald test is used, though nbinomLRT would also be acceptable. It is easier here to use Wald, as it means you do not need to subset `dds`. Check for genes containing `NA` in `padj`. For all tests, set the FDR cutoff for significance at 0.01, since there are many genes being tested. Across all conditions, there are **6886** significant DEGs. **5323** for CCSER1_S vs WT, **4987** for CCSER1_M vs WT, and **1292** for CCSER1_M vs CCSER1_S. Also check the histogram of p-values for all tests to ensure we do not observe batch effects.
+
+
+Writing all of the genes (regardless of padj), with annotation to csvs.
+```{r, eval = F}
+anns = ensembl.genes[ensembl.genes$gene_id %in% row.names(all_cond), ]
+exps = all_cond[row.names(all_cond) %in% anns$gene_id, ]
+sum(row.names(exps) == anns$gene_id)
+comb = cbind(as.data.frame(exps), as.data.frame(anns))[,-(7:12)]
+write.csv(comb, "CCSER1_annotated_genes.csv")
+```
+
+
+#### Venn Diagram
+```{r}
+#producing venn diagram of mutant deg overlap
+library(GOplot)
+
+m1sig = S_vs_WT[S_vs_WT$padj < 0.01, ]
+m2sig = M_vs_WT[M_vs_WT$padj < 0.01, ]
+m3sig = M_vs_S[M_vs_S$padj < 0.01, ]
+
+m1venn = data.frame(cbind(row.names(m1sig), m1sig[,2]))
+m2venn = data.frame(cbind(row.names(m2sig), m2sig[,2]))
+m3venn = data.frame(cbind(row.names(m3sig), m3sig[,2]))
+
+
+venn = GOVenn(m1venn, m2venn, m3venn, label = c("CCSER1_S vs WT", "CCSER1_M vs WT", "CCSER1_M vs CCSER1_S"), title = "Venn Diagram of CCSER1_S and CCSER1_M Significant DEGs", lfc.col = c("indianred1", "white", "lightskyblue"), circle.col = c("darkorange", "aquamarine", "plum"), plot = F)
+
+
+#venn$table
+venn$plot
+
+
+ggsave("body_venn.svg", height = 7, width = 8, units = "in")
+
+```
+
+
+```{r, eval=FALSE}
+
+
+temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$A_only),]
+temp$trend = venn$table$A_only[order(row.names(venn$table$A_only)), 2]
+nrow(venn$table$A_only) == length(temp)
+write.csv(temp, "S_unique.csv")
+
+temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$B_only),]
+temp$trend = venn$table$B_only[order(row.names(venn$table$B_only)), 2]
+nrow(venn$table$B_only) == length(temp)
+write.csv(temp, "M_unique.csv")
+
+temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$C_only),]
+temp$trend = venn$table$C_only[order(row.names(venn$table$C_only)), 2]
+nrow(venn$table$C_only) == length(temp)
+write.csv(temp, "MvsS_unique.csv")
+
+temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$AB),]
+temp$trend = venn$table$AB[order(row.names(venn$table$AB)), 3]
+nrow(venn$table$AB) == length(temp)
+write.csv(temp, "S_M_intersect.csv")
+
+temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$BC),]
+temp$trend = venn$table$BC[order(row.names(venn$table$BC)), 3]
+nrow(venn$table$BC) == length(temp)
+write.csv(temp, "M_MvsS_intersect.csv")
+
+temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$AC),]
+temp$trend = venn$table$AC[order(row.names(venn$table$AC)), 3]
+nrow(venn$table$AC) == length(temp)
+write.csv(temp, "S_MvsS_intersect.csv")
+
+temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$ABC),]
+temp$trend = venn$table$ABC[order(row.names(venn$table$ABC)), 4]
+nrow(venn$table$ABC) == length(temp)
+write.csv(temp, "All_intersect.csv")
+
+
+#this one is proportionate and can be fully tweaked, and really requires it to look good
+# library(VennDiagram)
+# overlap = calculate.overlap(x = list("M1" = m1venn$X1, "M2" = m2venn$X1))
+# 
+# venn = draw.pairwise.venn(length(overlap$a1), length(overlap$a2), length(overlap$a3), category = c("MUT1 vs WT", "MUT2 vs WT"), ext.text = F)
+# grid.newpage()
+# grid.draw(venn)
+
+
+
+```
+
+
+#### Writing significant DEG tables [NOT RUN]
+```{r, eval=F}
+#M1_vs_WT
+tmp = as.data.frame(m1sig)
+tmp = tmp[order(row.names(tmp), decreasing = F),]
+ann = as.data.frame(ensembl.genes[ensembl.genes$gene_id %in% row.names(tmp),1:5])
+tmp2 = cbind(ann, tmp)
+write.csv(tmp2, "S_vs_WT.csv")
+
+
+#M2_vs_WT
+tmp = as.data.frame(m2sig)
+tmp = tmp[order(row.names(tmp), decreasing = F),]
+ann = as.data.frame(ensembl.genes[ensembl.genes$gene_id %in% row.names(tmp),1:5])
+tmp2 = cbind(ann, tmp)
+write.csv(tmp2, "M_vs_WT.csv")
+
+
+#M1_vs_M2
+tmp = as.data.frame(m3sig)
+tmp = tmp[order(row.names(tmp), decreasing = F),]
+ann = as.data.frame(ensembl.genes[ensembl.genes$gene_id %in% row.names(tmp),1:5])
+tmp2 = cbind(ann, tmp)
+write.csv(tmp2, "M_vs_S.csv")
+
+
+```
+
+#### Writing ALL DEG tables [NOT RUN]
+```{r, eval=F}
+#M1_vs_WT
+tmp = as.data.frame(M1_vs_WT)
+tmp = tmp[order(row.names(tmp), decreasing = F),]
+ann = as.data.frame(ensembl.genes[ensembl.genes$gene_id %in% row.names(tmp),1:5])
+tmp2 = cbind(ann, tmp)
+write.csv(tmp2, "M1_vs_WT_all.csv")
+
+
+#M2_vs_WT
+tmp = as.data.frame(M2_vs_WT)
+tmp = tmp[order(row.names(tmp), decreasing = F),]
+ann = as.data.frame(ensembl.genes[ensembl.genes$gene_id %in% row.names(tmp),1:5])
+tmp2 = cbind(ann, tmp)
+write.csv(tmp2, "M2_vs_WT_all.csv")
+
+
+#M1_vs_M2
+tmp = as.data.frame(M1_vs_M2)
+tmp = tmp[order(row.names(tmp), decreasing = F),]
+ann = as.data.frame(ensembl.genes[ensembl.genes$gene_id %in% row.names(tmp),1:5])
+tmp2 = cbind(ann, tmp)
+write.csv(tmp2, "M1_vs_M2_all.csv")
+
+
+```
+
+
+
+
+
+
+#### Examine CCSER1 expression
+```{r}
+S_vs_WT[row.names(S_vs_WT) == "ENSDARG00000075919",] 
+M_vs_WT[row.names(M_vs_WT) == "ENSDARG00000075919",] 
+
+```
+
+Negative log2fc for both mutants with respect to wild type. Not padj < 0.01 however.
+
+### MA and volcano plots
+```{r}
+library(scales)
+
+#S_vs_WT
+plot(S_vs_WT$log2FoldChange, -log10(S_vs_WT$padj), xlim = c(-15, 15), col = alpha("dodgerblue",0.5), main = "Volcano, CCSER1_S vs WT")
+abline(h = 2, v = c(-2,2)) #p = 0.01 and lfc = +/- 2
+
+plotMA(S_vs_WT, ylim=c(-15,15), main = "MA Plot, CCSER1_S vs WT")
+
+#M_vs_WT
+plot(M_vs_WT$log2FoldChange, -log10(M_vs_WT$padj), xlim = c(-15, 15), col = alpha("seagreen",0.5), main = "Volcano, CCSER1_M vs WT")
+abline(h = 2, v = c(-2,2)) #p = 0.01 and lfc = +/- 2
+
+plotMA(M_vs_WT, ylim=c(-15,15), main = "MA Plot, CCSER1_M vs WT")
+
+#M_vs_S
+plot(M_vs_S$log2FoldChange, -log10(M_vs_S$padj), xlim = c(-15, 15), col = alpha("firebrick",0.5), main = "Volcano, CCSER1_M vs CCSER1_S")
+abline(h = 2, v = c(-2,2)) #p = 0.01 and lfc = +/- 2
+
+plotMA(M_vs_S, ylim=c(-15,15), main = "MA Plot, CCSER1_M vs CCSER1_S")
+
+```
+
+Produce MA and volcano plots for the pairwise comparisons. MA plots show the difference in gene expression (log fold change) between two conditions, relative to the mean expression across those conditions. Each point represents a particular gene. A gene with a similar expression level in both conditions will be near y = 0. Being further from y = 0 indicates up/down regulation. To compare along the x-axis: For a typically lowly expressed gene (low mean count), there is lower statistical power for an observed expression difference than a highly expressed gene (high A). MA plots tend to have even dispersion relative to the y-axis, which then decreases as x increases. Grey points indicate non-significant data points.
+
+Volcano plots compare adjusted p-value and log fold change. Here I use -log10(adjusted p-value) and log2(fold change). Again, each point represents a gene. The higher on the y-axis, the smaller the adjusted p-value. The more extreme the value on the x-axis, the greater the difference in expression levels across conditions. A greater dispersion means that the two groups have greater differences in gene expression.
+
+Both the MA plots show regulation changes between the mutants and wild type. Note that they also show a greater degree of downregulation than upregulation, which is also evident in the volcano plots. It is especially pronounced in CCSER1_M (the foldchange looks greater).
+
+These plots also allow us to see if any changes are particularly significant or large, so we can investigate those genes individually.
+
+#### Identifying specific genes from volcano plots
+```{r}
+library(ggrepel)
+library(hrbrthemes)
+
+#S vs WT
+S_vs_WT_d = as.data.frame(S_vs_WT)
+S_vs_WT_d$name = row.names(S_vs_WT_d)
+
+ggplot(S_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "dodgerblue") + labs(title = "Volcano, CCSER1_S vs WT") + geom_text_repel(data = subset(S_vs_WT_d, -log10(padj) > 50), size = 3) + theme_ipsum()
+
+#M vs WT
+M_vs_WT_d = as.data.frame(M_vs_WT)
+M_vs_WT_d$name = row.names(M_vs_WT_d)
+
+ggplot(M_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "seagreen") + labs(title = "Volcano, CCSER1_M vs WT") + geom_text_repel(data = subset(M_vs_WT_d, -log10(padj) > 30), size = 3) + theme_ipsum()
+
+#M vs S
+M_vs_S_d = as.data.frame(M_vs_S)
+M_vs_S_d$name = row.names(M_vs_S_d)
+
+ggplot(M_vs_S_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "firebrick") + labs(title = "Volcano, CCSER1_M vs CCSER1_S") + geom_text_repel(data = subset(M_vs_S_d, -log10(padj) > 50), size = 3) + theme_ipsum()
+```
+
+The conditions for gene labelling can be adjusted by applying different logic in `subset()`. Warnings of the form: `Removed k rows containing missing values (geom_point)` are just indicators that k of the data points are outside either `xlim()` or `ylim()`.
+
+
+### Z-scoring fold changes
+```{r}
+library(pheatmap)
+sig_results = all_cond[all_cond$padj < 0.01,] #the significantly differentially expressed genes from earlier
+
+#transform lfcs then z-score
+rlg = rlog(nb)
+rlg_sig = assay(rlg)[rownames(sig_results),]
+rlg_z = t(apply(rlg_sig, 1, function(x){ (x - mean(x)) / sd(x)})) #normalize by z-scoring
+
+thr = 3
+sum(rlg_z > thr)
+sum(rlg_z < -thr)
+#little data lost from thresholding, but always check! 
+#These can also be genes to investigate separately, due to their large scores
+
+rlg_z[rlg_z > thr] = thr
+rlg_z[rlg_z < -thr] = -thr
+```
+
+
+### K-means clustering
+``` {r}
+#determine number of clusters
+library(cluster)
+
+#use wss to choose number of clusters
+set.seed(123)
+k.max <- 15
+#1 cluster will almost never be the answer, so we'll leave it out for better visual discrimination
+wss <- sapply(2:k.max, 
+              function(k){kmeans(rlg_z, k, nstart=10,iter.max = 15 )$tot.withinss})
+
+plot(2:k.max, wss,
+     type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K",
+     ylab="Total within-clusters sum of squares", main = "WSS")
+#from wss, I think 5 would be a good value for nclust, based on the elbow method.
+
+#silhouette width to select clusters
+SIL = sapply(2:k.max, function(i) {
+  results.coef.kmeans =  kmeans(rlg_z, i, nstart=50, iter.max=50)
+    mean(silhouette(results.coef.kmeans$cluster, dist(rlg_z))[,3]) })
+plot(c(0,SIL), type="b", main = "Silhouette Width")
+#silhouette with says use 2 clusters, which is just unreasonable for the data. Confirms that 5 is a reasonable choice. width drops sharply after 5.
+
+#k-means with 5 clusters
+#clustering
+set.seed(123)
+nclust = 5
+results.coef.kmeans =  kmeans(rlg_z, nclust, nstart=50, iter.max=50)
+results.coef = rlg_z[order(results.coef.kmeans$cluster),]
+indicator = results.coef.kmeans$cluster[order(results.coef.kmeans$cluster)]
+
+#heatmapping
+color = c(colorRampPalette(c("dodgerblue2", "white"))(14), colorRampPalette(c("white", "firebrick2"))(14))
+breaksList = seq(-thr, thr, length.out = 29)
+
+heat.map <- pheatmap(results.coef, cluster_col=F, breaks=breaksList, cluster_rows=F, show_rownames=FALSE,color = color,fontsize_row = 3, legend=TRUE,border_color = NA,main = "k-means clustering, k=5", angle_col = 90)
+
+#cluster sizes
+table(results.coef.kmeans$cluster)
+
+```
+
+After performing a z-score normalization on the expression of significant DEGs across all conditions, calculate the WSS and silhouette width for 2 to 15 clusters, to determine the correct number of clusters for the analysis. Combining the results of both statistics, k = 5 would be a reasonable choice, and then perform the clustering.
+
+Cluster 1 is down in mutants, and up in the wt.
+Cluster 2 is up in the mutants, and down in the wt.
+Cluster 3 is up in missense, and slightly down in others.
+Cluster 4 is up in nonsense/stop, and down in others.
+Cluster 5 is down in nonsense/stop, and up in others.
+
+
+
+Writing clusters to csv.
+
+```{r, eval = F}
+c = names(results.coef.kmeans$cluster[results.coef.kmeans$cluster==1])
+t1 = as.data.frame(sig_results[row.names(sig_results) %in% c, ])
+t1$gene_id = row.names(t1)
+t1
+t2 = as.data.frame(ensembl.genes[ensembl.genes$gene_id %in% c, ])
+t2
+t3 = merge(t1, t2, by = "gene_id", all.x = T, all.y = T)
+write.csv(t3, "CCSER1_cluster1.csv")
+
+```
+
+
+
+
+### GO:BP enrichment of clusters
+```{r}
+library(clusterProfiler) #biocmanager install.  
+library(org.Dr.eg.db) #biocmanager install.  
+library(stringr)
+library(ggplot2)
+
+bp = list()
+for (i in 1:nclust) {
+  bp[i] = enrichGO(gene          = names(results.coef.kmeans$cluster[results.coef.kmeans$cluster==i]),
+                universe      = rownames(nb),
+                OrgDb         = org.Dr.eg.db,
+                keyType       = 'ENSEMBL',
+                ont           = "BP",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.1,
+                readable      = TRUE)
+#gene identifiers are ensemble IDs
+#orgdb = organism annotation
+#ont           = ontology. GO has MF (molecular function), BP (biological process), CC (cellular component).
+#universe = all of the genes, after filtering out rRNA/mtRNA and low expression crap
+#padj = FDR method
+#no pvalue cutoff
+
+}
+#ignore the warning messages
+
+#first check if any of the clusters produce no enrichments
+# head(bp[[1]])
+# head(bp[[2]])
+# head(bp[[3]])
+# head(bp[[4]])
+# head(bp[[5]])
+
+
+#the top 10 terms in the cluster. gene ratio is the number you observe vs expected, like effect size
+
+bp1 = dotplot(bp[[1]], title = "GO:BP Enrichment of Cluster 1", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+bp2=dotplot(bp[[2]], title = "GO:BP Enrichment of Cluster 2", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+bp3=dotplot(bp[[3]], title = "GO:BP Enrichment of Cluster 3", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+bp4=dotplot(bp[[4]], title = "GO:BP Enrichment of Cluster 4", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+bp5=dotplot(bp[[5]], title = "GO:BP Enrichment of Cluster 5", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+
+bp1
+bp2
+bp3
+bp4
+bp5
+
+```
+
+Write the enrichment itself to csv.
+
+Writing enrichments to csvs.
+```{r, eval=F}
+write.csv(bp1$data, "terms_bp1.csv")
+write.csv(bp2$data, "terms_bp2.csv")
+write.csv(bp3$data, "terms_bp3.csv")
+write.csv(bp4$data, "terms_bp4.csv")
+write.csv(bp5$data, "terms_bp5.csv")
+```
+
+Genes associated with select terms matched to annotation and written to csvs.
+```{r, eval=F}
+
+# ann = ensembl.genes[ensembl.genes$zfin_id_symbol %in% strsplit(bp1$data$geneID[1], "/")[[1]], ]
+# 
+# sig_results[row.names(sig_results) %in% ann$gene_id, ]
+# 
+# ann[!(ann$gene_id %in% row.names(all_cond)), ]
+# 
+#cluster 1
+for (i in 1:nrow(bp1$data)) {
+  write.csv(ensembl.genes[ensembl.genes$zfin_id_symbol %in% strsplit(bp1$data$geneID[i], "/")[[1]], ], paste("ann_bp1_",i,".csv", sep =""))
+}
+
+
+
+
+#cluster 2
+for (i in 1:nrow(bp2$data)) {
+  write.csv(ensembl.genes[ensembl.genes$zfin_id_symbol %in% strsplit(bp2$data$geneID[i], "/")[[1]], ], paste("ann_bp2_",i,".csv", sep =""))
+}
+
+
+
+
+
+
+
+
+
+
+```
+
+
+
+
+
+### GO:MF enrichment of clusters
+``` {r}
+mf = list()
+for (i in 1:nclust) {
+  mf[i] = enrichGO(gene          = names(results.coef.kmeans$cluster[results.coef.kmeans$cluster==i]),
+                universe      = rownames(nb),
+                OrgDb         = org.Dr.eg.db,
+                keyType       = 'ENSEMBL',
+                ont           = "MF",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.1,
+                readable      = TRUE)
+}
+
+# head(mf[[1]])
+# head(mf[[2]])
+# head(mf[[3]])
+# head(mf[[4]])
+# head(mf[[5]])
+# 
+
+mf1=dotplot(mf[[1]], title = "GO:MF Enrichment of Cluster 1", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+mf2=dotplot(mf[[2]], title = "GO:MF Enrichment of Cluster 2", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+mf3=dotplot(mf[[3]], title = "GO:MF Enrichment of Cluster 3", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+mf4=dotplot(mf[[4]], title = "GO:MF Enrichment of Cluster 4", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+mf5=dotplot(mf[[5]], title = "GO:MF Enrichment of Cluster 5", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+
+
+
+mf1
+mf2
+mf3
+mf4
+mf5
+```
+
+```{r, eval=F}
+write.csv(mf1$data, "terms_mf1.csv")
+write.csv(mf2$data, "terms_mf2.csv")
+write.csv(mf3$data, "terms_mf3.csv")
+write.csv(mf4$data, "terms_mf4.csv")
+write.csv(mf5$data, "terms_mf5.csv")
+```
+
+Genes associated with select terms matched to annotation and written to csvs.
+```{r, eval=F}
+
+for (i in 1:nrow(mf1$data)) {
+  write.csv(ensembl.genes[ensembl.genes$zfin_id_symbol %in% strsplit(mf1$data$geneID[i], "/")[[1]], ], paste("ann_mf1_",i,".csv", sep =""))
+}
+
+
+for (i in 1:nrow(mf2$data)) {
+  write.csv(ensembl.genes[ensembl.genes$zfin_id_symbol %in% strsplit(mf2$data$geneID[i], "/")[[1]], ], paste("ann_mf2_",i,".csv", sep =""))
+}
+
+
+```
+
+
+
+### KEGG enrichment of clusters
+``` {r}
+kegg = list()
+for (i in 1:nclust) {
+  kegg[i] = enrichKEGG(gene          = as.character(ensembl.genes[ensembl.genes$gene_id %in% names(results.coef.kmeans$cluster[results.coef.kmeans$cluster==i])]$entrezgene_id),
+              universe      = as.character(ensembl.genes[ensembl.genes$gene_id %in% rownames(dds)]$entrezgene_id),
+              organism         = "dre",
+              qvalueCutoff  = 0.1)
+
+}
+
+
+head(kegg[[1]])
+head(kegg[[2]], 10)$ID
+head(kegg[[3]])
+# head(kegg[[4]]) #no enrichment
+head(kegg[[5]])
+
+
+#the top 10 terms in the cluster. gene ratio is the number you observe vs expected, like effect size
+dotplot(kegg[[1]], title = "KEGG Enrichment of Cluster 1", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+dotplot(kegg[[2]], title = "KEGG Enrichment of Cluster 2", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+dotplot(kegg[[3]], title = "KEGG Enrichment of Cluster 3", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+#dotplot(kegg[[4]], title = "KEGG Enrichment of Cluster 4", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+dotplot(kegg[[5]], title = "KEGG Enrichment of Cluster 5", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+
+```
+
+
+
+### GO:BP enrichment of pairwise DEGs
+```{r}
+swt_sig = S_vs_WT[S_vs_WT$padj < 0.01,]
+swt_bp = enrichGO(gene          = rownames(swt_sig),
+                universe      = rownames(nb),
+                OrgDb         = org.Dr.eg.db,
+                keyType       = 'ENSEMBL',
+                ont           = "BP",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.1,
+                readable      = TRUE)
+
+# head(swt_bp)
+bps = dotplot(swt_bp, title = "GO:BP enrichment of differentially expressed genes (CCSER1_S vs WT)", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+bps
+
+mwt_sig = M_vs_WT[M_vs_WT$padj < 0.01,]
+mwt_bp = enrichGO(gene          = rownames(mwt_sig),
+                universe      = rownames(nb),
+                OrgDb         = org.Dr.eg.db,
+                keyType       = 'ENSEMBL',
+                ont           = "BP",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.1,
+                readable      = TRUE)
+
+# head(mwt_bp)
+bpm = dotplot(mwt_bp, title = "GO:BP enrichment of differentially expressed genes (CCSER1_M vs WT)", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+bpm
+
+ms_sig = M_vs_S[M_vs_S$padj < 0.01,]
+ms_bp = enrichGO(gene          = rownames(ms_sig),
+                universe      = rownames(nb),
+                OrgDb         = org.Dr.eg.db,
+                keyType       = 'ENSEMBL',
+                ont           = "BP",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.1,
+                readable      = TRUE)
+
+# head(ms_bp)
+dotplot(ms_bp, title = "GO:BP enrichment of differentially expressed genes (CCSER1_M vs CCSER1_S)", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+#again, seeing the same p-value for multiple terms. there must be a simple explanation.
+```
+
+
+```{r, eval=F}
+write.csv(bps$data, "terms_bp_mwt.csv")
+write.csv(bpm$data, "terms_bp_swt.csv")
+
+```
+
+
+
+### Gene set enrichment analysis
+``` {r}
+library(fgsea) #biocmanager install
+library(msigdbr)
+library(dplyr)
+library(gridExtra)
+
+#get gene sets
+#msigdbr_species()
+msigdbr_collections()
+
+
+#You must select a collection (the category argument). descriptions are on http://www.gsea-msigdb.org/gsea/msigdb/index.jsp
+collection = "H"
+subcat = NULL
+d_df = msigdbr(species = "Danio rerio", category = collection, subcategory = subcat)
+#length(unique(m_df$gs_name))# number of genesets
+fgsea_sets = d_df %>% split(x = .$ensembl_gene, f = .$gs_name) #msigdb now supports ensembl! used to be entrezgene
+```
+For the moment, we are only looking at MSigDB's hallmark gene sets. From MSigDB: "Hallmark gene sets summarize and represent specific well-defined biological states or processes and display coherent expression. These gene sets were generated by a computational methodology based on identifying gene set overlaps and retaining genes that display coordinate expression. The hallmarks reduce noise and redundancy and provide a better delineated biological space for GSEA. We refer to the original overlapping gene sets, from which a hallmark is derived, as its 'founder' sets. Hallmark gene set pages provide links to the corresponding founder sets for deeper follow up."
+
+All gene set descriptions here: http://www.gsea-msigdb.org/gsea/msigdb/index.jsp
+
+**The most relevant collections for this experiment are C4, C6, and C7.**
+
+#### CCSER1_S vs WT
+```{r}
+changes = S_vs_WT #recall that this is before we got significant_results, but after we cleaned and ran negbinom/wald. premise of gsea is that the individual expression changes needn't be significant, so this is what we want to search within.
+# sum(ensembl.genes$gene_id %in% row.names(changes)) #the number of genes we matched in the annotation
+# changes[!(row.names(changes) %in% ensembl.genes$gene_id),] #the genes in the data we failed to match. They simply do not exist in the annotation. Strange.
+
+
+ensembl_sub = ensembl.genes[ensembl.genes$gene_id %in% row.names(changes), ] #subset annotation according to overlap
+changes_sub = changes[row.names(changes) %in% ensembl.genes$gene_id, ] #subset change data according to overlap
+sum(ensembl_sub$gene_id == row.names(changes_sub)) #all gene ids identical
+
+ensembl_sub$log2FoldChange = changes_sub$log2FoldChange #get corresponding foldchanges
+
+#create vector of fold changes to be ranked by lfc
+ensembl_sub_lfc = ensembl_sub$log2FoldChange
+names(ensembl_sub_lfc) = ensembl_sub$gene_id
+
+#order by lfc
+ensembl_sub_lfc = ensembl_sub_lfc[order(ensembl_sub_lfc, decreasing = T)]
+#filter for protein coding genes
+ensembl_sub_lfc = ensembl_sub_lfc[names(ensembl_sub_lfc) %in% ensembl_sub$gene_id[ensembl_sub$gene_biotype=="protein_coding"]]
+#run gsea
+fgseaRes <- fgseaMultilevel(pathways = fgsea_sets, 
+                  stats = ensembl_sub_lfc,
+                  minSize = 1,
+                  maxSize = 500,
+                  eps = 0)
+
+#plot
+fgseaResTidy = fgseaRes %>% as_tibble() %>% arrange(desc(NES))
+fgseaResTidy %>% dplyr::select(-leadingEdge, -ES) %>% arrange(padj) 
+ggplot(fgseaResTidy %>% filter(padj < 0.05) %>% head(n= 20), aes(reorder(pathway, NES), NES)) + coord_flip() + geom_col(aes(fill = NES < 2.5)) + labs(x="Term", y="Normalized Enrichment Score", title=paste("GSEA of CCSER1_S vs WT, on Ontology Gene Set",collection)) + theme_minimal() + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+
+#we can also look at a specific term's enrichment
+# plotEnrichment(fgsea_sets[["HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION"]], ensembl_sub_lfc) + labs(title="HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION")
+```
+
+```{r}
+#need a separate chunk or it won't knit properly
+#another way to visualize gsea
+topPathwaysUp <- fgseaRes[ES > 0][head(order(padj), n=10), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(fgsea_sets[topPathways], ensembl_sub_lfc, fgseaRes, gseaParam = 0.5, render = T)
+```
+
+
+#### CCSER1_M vs WT
+```{r}
+changes = M_vs_WT #recall that this is before we got significant_results, but after we cleaned and ran negbinom/wald. premise of gsea is that the individual expression changes needn't be significant, so this is what we want to search within.
+
+# sum(ensembl.genes$gene_id %in% row.names(changes)) #the number of genes we matched in the annotation
+# changes[!(row.names(changes) %in% ensembl.genes$gene_id),] #the genes in the data we failed to match. They simply do not exist in the annotation. Strange.
+
+
+ensembl_sub = ensembl.genes[ensembl.genes$gene_id %in% row.names(changes), ] #subset annotation according to overlap
+changes_sub = changes[row.names(changes) %in% ensembl.genes$gene_id, ] #subset change data according to overlap
+sum(ensembl_sub$gene_id == row.names(changes_sub)) #all gene ids identical
+
+ensembl_sub$log2FoldChange = changes_sub$log2FoldChange #get corresponding foldchanges
+
+#create vector of fold changes to be ranked by lfc
+ensembl_sub_lfc = ensembl_sub$log2FoldChange
+names(ensembl_sub_lfc) = ensembl_sub$gene_id
+
+#order by lfc
+ensembl_sub_lfc = ensembl_sub_lfc[order(ensembl_sub_lfc, decreasing = T)]
+#filter for protein coding genes
+ensembl_sub_lfc = ensembl_sub_lfc[names(ensembl_sub_lfc) %in% ensembl_sub$gene_id[ensembl_sub$gene_biotype=="protein_coding"]]
+#run gsea
+fgseaRes <- fgseaMultilevel(pathways = fgsea_sets, 
+                  stats = ensembl_sub_lfc,
+                  minSize = 1,
+                  maxSize = 500,
+                  eps = 0)
+
+#plot
+fgseaResTidy = fgseaRes %>% as_tibble() %>% arrange(desc(NES))
+fgseaResTidy %>% dplyr::select(-leadingEdge, -ES) %>% arrange(padj) 
+ggplot(fgseaResTidy %>% filter(padj < 0.05) %>% head(n= 20), aes(reorder(pathway, NES), NES)) + coord_flip() + geom_col(aes(fill = NES < 2.5)) + labs(x="Term", y="Normalized Enrichment Score", title=paste("GSEA of CCSER1_M vs WT, on Ontology Gene Set",collection)) + theme_minimal() + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+
+```
+
+```{r}
+topPathwaysUp <- fgseaRes[ES > 0][head(order(padj), n=10), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(fgsea_sets[topPathways], ensembl_sub_lfc, fgseaRes, gseaParam = 0.5, render = T)
+```
+
+
+#### CCSER1_M vs CCSER1_S
+```{r}
+changes = M_vs_S #recall that this is before we got significant_results, but after we cleaned and ran negbinom/wald. premise of gsea is that the individual expression changes needn't be significant, so this is what we want to search within.
+
+# sum(ensembl.genes$gene_id %in% row.names(changes)) #the number of genes we matched in the annotation
+# changes[!(row.names(changes) %in% ensembl.genes$gene_id),] #the genes in the data we failed to match. They simply do not exist in the annotation. Strange.
+
+
+ensembl_sub = ensembl.genes[ensembl.genes$gene_id %in% row.names(changes), ] #subset annotation according to overlap
+changes_sub = changes[row.names(changes) %in% ensembl.genes$gene_id, ] #subset change data according to overlap
+sum(ensembl_sub$gene_id == row.names(changes_sub)) #all gene ids identical
+
+ensembl_sub$log2FoldChange = changes_sub$log2FoldChange #get corresponding foldchanges
+
+#create vector of fold changes to be ranked by lfc
+ensembl_sub_lfc = ensembl_sub$log2FoldChange
+names(ensembl_sub_lfc) = ensembl_sub$gene_id
+
+#order by lfc
+ensembl_sub_lfc = ensembl_sub_lfc[order(ensembl_sub_lfc, decreasing = T)]
+#filter for protein coding genes
+ensembl_sub_lfc = ensembl_sub_lfc[names(ensembl_sub_lfc) %in% ensembl_sub$gene_id[ensembl_sub$gene_biotype=="protein_coding"]]
+#run gsea
+fgseaRes <- fgseaMultilevel(pathways = fgsea_sets, 
+                  stats = ensembl_sub_lfc,
+                  minSize = 1,
+                  maxSize = 500,
+                  eps = 0)
+
+#plot
+fgseaResTidy = fgseaRes %>% as_tibble() %>% arrange(desc(NES))
+fgseaResTidy %>% dplyr::select(-leadingEdge, -ES) %>% arrange(padj) 
+
+# ggplot(fgseaResTidy %>% filter(padj < 0.05) %>% head(n= 20), aes(reorder(pathway, NES), NES)) + coord_flip() + geom_col(aes(fill = NES < 2.5)) + labs(x="Term", y="Normalized Enrichment Score", title=paste("GSEA of CCSER1_M vs CCSER1_S, on Ontology Gene Set",collection)) + theme_minimal() + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+```
+
+```{r}
+topPathwaysUp <- fgseaRes[ES > 0][head(order(padj), n=10), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(fgsea_sets[topPathways], ensembl_sub_lfc, fgseaRes, gseaParam = 0.5, render = T)
+```
+
+### Custom GSEA
+```{r}
+# pathways = gmtPathways("HuGSEA.txt")
+# set1 = sapply(pathways, tolower) #lowercase everything for zfin
+# set2 = paste(set1, "a", sep = "") #add the a genome duplicate
+# set3 = paste(set1, "b", sep = "") #add the b genome duplicate
+# set4 = substr(set1,1,nchar(set1)-1) #no duplicate
+# #the idea is to cast a wide enough net to catch all the desired genes (that exist in the annotation), but not so wide as to pick up others.
+# combined = c(set1, set2, set3, set4)
+# 
+# #naive search
+# search1 = ensembl.genes[ensembl.genes$zfin_id_symbol %in% set1, ]
+# 
+# #expanded search
+# search2 = ensembl.genes[ensembl.genes$zfin_id_symbol %in% combined, ]
+# 
+# # #the disjunction
+# # dis = search2[!(search2$zfin_id_symbol %in% search1$zfin_id_symbol), ]
+# 
+# #recreate gsea set, with zebrafish ensembl gene ids
+# paths = list(search2$gene_id)
+# names(paths) = "Alcoholism" #adjust as needed for multiple pathways. bit of a bodge.
+# paths
+
+```
+Obsolete method. Use below.
+
+
+Using HGNC Comparison of Orthology Predictions (HCOP) data to translate from human genes/gene symbols to zebrafish orthologs.
+```{r}
+pathways = gmtPathways("HuGSEA.txt")
+lookup = read.csv("human_zebrafish_hcop_fifteen_column.txt", sep = "\t")
+setname = "Hu et al. (2018)"
+
+length(unique(lookup$zebrafish_ensembl_gene)) #number of unique orthologs in the entire hcop table
+#compare with ensembl: 25592 coding genes in the zebrafish primary assembly.
+
+paths = list()
+for (i in 1:length(pathways)) {
+  paths[[i]] = lookup[lookup$human_symbol %in% pathways[[i]], 9]
+  paths[[i]] = paths[[i]][nchar(paths[[i]]) == 18]
+  paths[[i]] = unique(paths[[i]])
+}
+
+names(paths) = names(pathways) #adjust as needed for multiple pathways
+
+sapply(paths, length)
+```
+
+Using data from Table 1 in "Analyzing the genes related to nicotine addiction or schizophrenia via a pathway and network based approach" by Hu et al. (2018).
+
+#### CCSER1_S vs WT
+``` {r}
+changes = S_vs_WT 
+
+ensembl_sub = ensembl.genes[ensembl.genes$gene_id %in% row.names(changes), ] #subset annotation according to overlap
+changes_sub = changes[row.names(changes) %in% ensembl.genes$gene_id, ] #subset change data according to overlap
+sum(ensembl_sub$gene_id == row.names(changes_sub)) #all gene ids identical
+
+ensembl_sub$log2FoldChange = changes_sub$log2FoldChange #get corresponding foldchanges
+
+#create vector of fold changes to be ranked by lfc
+ensembl_sub_lfc = ensembl_sub$log2FoldChange
+names(ensembl_sub_lfc) = ensembl_sub$gene_id
+
+#order by lfc
+ensembl_sub_lfc = ensembl_sub_lfc[order(ensembl_sub_lfc, decreasing = T)]
+#filter for protein coding genes
+ensembl_sub_lfc = ensembl_sub_lfc[names(ensembl_sub_lfc) %in% ensembl_sub$gene_id[ensembl_sub$gene_biotype=="protein_coding"]]
+
+fgseaRes <- fgseaMultilevel(pathways = paths, 
+                  stats = ensembl_sub_lfc,
+                  minSize = 1,
+                  maxSize = 500,
+                  eps = 0)
+head(fgseaRes)
+
+
+
+```
+
+For an explanation of why the p-value and padj can be the same, see nominal p-value on this site: https://www.gsea-msigdb.org/gsea/doc/GSEAUserGuideFrame.html
+
+```{r}
+topPathwaysUp <- fgseaRes[ES > 0][head(order(padj), n=10), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(paths[topPathways], ensembl_sub_lfc, fgseaRes, gseaParam = 0.5, render = T)
+```
+
+
+```{r}
+#plot
+fgseaResTidy = fgseaRes %>% as_tibble() %>% arrange(desc(NES))
+fgseaResTidy %>% dplyr::select(-leadingEdge, -ES) %>% arrange(padj) 
+ggplot(fgseaResTidy %>% filter(padj < 0.05) %>% head(n= 20), aes(reorder(pathway, NES), NES)) + coord_flip() + geom_col(aes(fill = NES < 2.5)) + labs(x="Term", y="Normalized Enrichment Score", title=paste("GSEA of CCSER1_S vs WT, on Custom Gene Set:",setname)) + theme_minimal() + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+```
+
+
+```{r}
+plotEnrichment(paths[["Neuroactive ligand- receptor interaction"]], ensembl_sub_lfc) + labs(title="Neuroactive ligand- receptor interaction") #check pathway names VERY carefully
+
+plotEnrichment(paths[["Glutamatergic synapse"]], ensembl_sub_lfc) + labs(title="Glutamatergic synapse") #check pathway names VERY carefully
+
+plotEnrichment(paths[["Nicotine addiction"]], ensembl_sub_lfc) + labs(title="Nicotine addiction") #check pathway names VERY carefully
+
+plotEnrichment(paths[["Alcoholism"]], ensembl_sub_lfc) + labs(title="Alcoholism") #check pathway names VERY carefully
+
+
+
+
+```
+
+
+#### CCSER1_M vs WT
+``` {r}
+changes = M_vs_WT 
+
+ensembl_sub = ensembl.genes[ensembl.genes$gene_id %in% row.names(changes), ] #subset annotation according to overlap
+changes_sub = changes[row.names(changes) %in% ensembl.genes$gene_id, ] #subset change data according to overlap
+sum(ensembl_sub$gene_id == row.names(changes_sub)) #all gene ids identical
+
+ensembl_sub$log2FoldChange = changes_sub$log2FoldChange #get corresponding foldchanges
+
+#create vector of fold changes to be ranked by lfc
+ensembl_sub_lfc = ensembl_sub$log2FoldChange
+names(ensembl_sub_lfc) = ensembl_sub$gene_id
+
+#order by lfc
+ensembl_sub_lfc = ensembl_sub_lfc[order(ensembl_sub_lfc, decreasing = T)]
+#filter for protein coding genes
+ensembl_sub_lfc = ensembl_sub_lfc[names(ensembl_sub_lfc) %in% ensembl_sub$gene_id[ensembl_sub$gene_biotype=="protein_coding"]]
+
+fgseaRes <- fgseaMultilevel(pathways = paths, 
+                  stats = ensembl_sub_lfc,
+                  minSize = 1,
+                  maxSize = 500,
+                  eps = 0)
+head(fgseaRes)
+plotEnrichment(paths[["Alcoholism"]], ensembl_sub_lfc) + labs(title="Alcoholism") #check pathway names VERY carefully
+
+```
+
+```{r}
+topPathwaysUp <- fgseaRes[ES > 0][head(order(padj), n=10), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(paths[topPathways], ensembl_sub_lfc, fgseaRes, gseaParam = 0.5, render = T)
+```
+
+
+```{r}
+#plot
+fgseaResTidy = fgseaRes %>% as_tibble() %>% arrange(desc(NES))
+fgseaResTidy %>% dplyr::select(-leadingEdge, -ES) %>% arrange(padj) 
+ggplot(fgseaResTidy %>% filter(padj < 0.05) %>% head(n= 20), aes(reorder(pathway, NES), NES)) + coord_flip() + geom_col(aes(fill = NES < 2.5)) + labs(x="Term", y="Normalized Enrichment Score", title=paste("GSEA of CCSER1_M vs WT, on Custom Gene Set:",setname)) + theme_minimal() + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+```
+
+
+#### CCSER1_M vs CCSER1_S
+``` {r}
+changes = M_vs_S
+
+ensembl_sub = ensembl.genes[ensembl.genes$gene_id %in% row.names(changes), ] #subset annotation according to overlap
+changes_sub = changes[row.names(changes) %in% ensembl.genes$gene_id, ] #subset change data according to overlap
+sum(ensembl_sub$gene_id == row.names(changes_sub)) #all gene ids identical
+
+ensembl_sub$log2FoldChange = changes_sub$log2FoldChange #get corresponding foldchanges
+
+#create vector of fold changes to be ranked by lfc
+ensembl_sub_lfc = ensembl_sub$log2FoldChange
+names(ensembl_sub_lfc) = ensembl_sub$gene_id
+
+#order by lfc
+ensembl_sub_lfc = ensembl_sub_lfc[order(ensembl_sub_lfc, decreasing = T)]
+#filter for protein coding genes
+ensembl_sub_lfc = ensembl_sub_lfc[names(ensembl_sub_lfc) %in% ensembl_sub$gene_id[ensembl_sub$gene_biotype=="protein_coding"]]
+
+fgseaRes <- fgseaMultilevel(pathways = paths, 
+                  stats = ensembl_sub_lfc,
+                  minSize = 1,
+                  maxSize = 500,
+                  eps = 0)
+head(fgseaRes)
+plotEnrichment(paths[["Alcoholism"]], ensembl_sub_lfc) + labs(title="Alcoholism") #check pathway names VERY carefully
+
+```
+
+```{r}
+#plot
+fgseaResTidy = fgseaRes %>% as_tibble() %>% arrange(desc(NES))
+fgseaResTidy %>% dplyr::select(-leadingEdge, -ES) %>% arrange(padj) 
+# ggplot(fgseaResTidy %>% filter(padj < 0.05) %>% head(n= 20), aes(reorder(pathway, NES), NES)) + coord_flip() + geom_col(aes(fill = NES < 2.5)) + labs(x="Term", y="Normalized Enrichment Score", title=paste("GSEA of CCSER1_M vs CCSER1_S, on Custom Gene Set:",setname)) + theme_minimal() + scale_y_discrete(labels=function(x) str_wrap(x, width=40))
+```
+
+
+
+### Volcano plotting specific orthologs
+Using a combination of the annotated volcano plot from earlier and custom gsea ortholog lookup method.
+
+```{r}
+library(hrbrthemes)
+#conversion
+s1 = c("ATM","ATR")
+o1 = lookup[lookup$human_symbol %in% s1, c(5,9,12)]
+o1 = o1[nchar(o1$zebrafish_ensembl_gene) == 18, ]
+
+
+#S vs WT
+d1 = S_vs_WT_d[S_vs_WT_d$name %in% o1$zebrafish_ensembl_gene, ]
+ggplot(S_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "dodgerblue") + labs(title = "Volcano, CCSER1_S vs WT") + geom_point(data = d1, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d1, size = 3) + theme_ipsum()
+
+m1 = merge(o1, d1, by.x = 2, by.y = 7)
+ggplot(m1, aes(x = log2FoldChange, y = -log10(padj), label=zebrafish_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CCSER1_S vs WT") + geom_text_repel(data = m1, size = 3) + theme_ipsum()
+
+
+#zfish names
+d2 = S_vs_WT_d[S_vs_WT_d$name %in% m1$zebrafish_ensembl_gene, ]
+d2$name = m1$zebrafish_symbol
+
+ggplot(S_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "dodgerblue") + labs(title = "Volcano, CCSER1_S vs WT") + geom_point(data = d2[d2$padj < 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="firebrick2") + geom_point(data = d2[d2$padj >= 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d2, size = 4) + theme_ipsum() + xlim(c(-5,5)) + ylim(c(0,40))
+
+
+
+#M vs WT
+d2 = M_vs_WT_d[M_vs_WT_d$name %in% o1$zebrafish_ensembl_gene, ]
+ggplot(M_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "seagreen") + labs(title = "Volcano, CCSER1_M vs WT") + geom_point(data = d2, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d2, size = 3) + theme_ipsum()
+
+m2 = merge(o1, d2, by.x = 2, by.y = 7)
+ggplot(m2, aes(x = log2FoldChange, y = -log10(padj), label=zebrafish_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CCSER1_M vs WT") + geom_text_repel(data = m2, size = 3) + theme_ipsum()
+
+
+#zfish names
+d2 = M_vs_WT_d[M_vs_WT_d$name %in% m1$zebrafish_ensembl_gene, ]
+d2$name = m1$zebrafish_symbol
+
+ggplot(M_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "seagreen") + labs(title = "Volcano, CCSER1_M vs WT") + geom_point(data = d2[d2$padj < 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="firebrick2") + geom_point(data = d2[d2$padj >= 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d2, size = 4) + theme_ipsum() + xlim(c(-5,5)) + ylim(c(0,40))
+
+
+
+
+#M vs S
+d3 = M_vs_S_d[M_vs_S_d$name %in% o1$zebrafish_ensembl_gene, ]
+ggplot(M_vs_S_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "firebrick") + labs(title = "Volcano, CCSER1_M vs CCSER1_S") + geom_point(data = d3, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d3, size = 3) + theme_ipsum()
+
+m3 = merge(o1, d3, by.x = 2, by.y = 7)
+ggplot(m3, aes(x = log2FoldChange, y = -log10(padj), label=zebrafish_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CCSER1_M vs CCSER1_S") + geom_text_repel(data = m3, size = 3) + theme_ipsum()
+
+
+```
+
+```{r}
+s1 = c("XRCC5","XRCC6") # aka Ku70/Ku80
+o1 = lookup[lookup$human_symbol %in% s1, c(5,9,12)]
+o1 = o1[nchar(o1$zebrafish_ensembl_gene) == 18, ]
+
+#S vs WT
+d1 = S_vs_WT_d[S_vs_WT_d$name %in% o1$zebrafish_ensembl_gene, ]
+ggplot(S_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "dodgerblue") + labs(title = "Volcano, CCSER1_S vs WT") + geom_point(data = d1, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d1, size = 3) + theme_ipsum()
+
+m1 = merge(o1, d1, by.x = 2, by.y = 7)
+ggplot(m1, aes(x = log2FoldChange, y = -log10(padj), label=zebrafish_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CCSER1_S vs WT") + geom_text_repel(data = m1, size = 3) + theme_ipsum()
+
+#M vs WT
+d2 = M_vs_WT_d[M_vs_WT_d$name %in% o1$zebrafish_ensembl_gene, ]
+ggplot(M_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "seagreen") + labs(title = "Volcano, CCSER1_M vs WT") + geom_point(data = d2, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d2, size = 3) + theme_ipsum()
+
+m2 = merge(o1, d2, by.x = 2, by.y = 7)
+ggplot(m2, aes(x = log2FoldChange, y = -log10(padj), label=zebrafish_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CCSER1_M vs WT") + geom_text_repel(data = m2, size = 3) + theme_ipsum()
+
+#M vs S
+d3 = M_vs_S_d[M_vs_S_d$name %in% o1$zebrafish_ensembl_gene, ]
+ggplot(M_vs_S_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "firebrick") + labs(title = "Volcano, CCSER1_M vs CCSER1_S") + geom_point(data = d3, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d3, size = 3) + theme_ipsum()
+
+m3 = merge(o1, d3, by.x = 2, by.y = 7)
+ggplot(m3, aes(x = log2FoldChange, y = -log10(padj), label=zebrafish_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CCSER1_M vs CCSER1_S") + geom_text_repel(data = m3, size = 3) + theme_ipsum()
+
+```
+
+```{r}
+s1 = c("MDM2", "EGFR", "CDK4", "MYC")
+o1 = lookup[lookup$human_symbol %in% s1, c(5,9,12)]
+o1 = o1[nchar(o1$zebrafish_ensembl_gene) == 18, ]
+
+#S vs WT
+d1 = S_vs_WT_d[S_vs_WT_d$name %in% o1$zebrafish_ensembl_gene, ]
+ggplot(S_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "dodgerblue") + labs(title = "Volcano, CCSER1_S vs WT") + geom_point(data = d1, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d1, size = 3) + theme_ipsum()
+
+m1 = merge(o1, d1, by.x = 2, by.y = 7)
+ggplot(m1, aes(x = log2FoldChange, y = -log10(padj), label=zebrafish_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CCSER1_S vs WT") + geom_text_repel(data = m1, size = 3) + theme_ipsum()
+
+#M vs WT
+d2 = M_vs_WT_d[M_vs_WT_d$name %in% o1$zebrafish_ensembl_gene, ]
+ggplot(M_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "seagreen") + labs(title = "Volcano, CCSER1_M vs WT") + geom_point(data = d2, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d2, size = 3) + theme_ipsum()
+
+m2 = merge(o1, d2, by.x = 2, by.y = 7)
+ggplot(m2, aes(x = log2FoldChange, y = -log10(padj), label=zebrafish_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CCSER1_M vs WT") + geom_text_repel(data = m2, size = 3) + theme_ipsum()
+
+#M vs S
+d3 = M_vs_S_d[M_vs_S_d$name %in% o1$zebrafish_ensembl_gene, ]
+ggplot(M_vs_S_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "firebrick") + labs(title = "Volcano, CCSER1_M vs CCSER1_S") + geom_point(data = d3, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d3, size = 3) + theme_ipsum()
+
+m3 = merge(o1, d3, by.x = 2, by.y = 7)
+ggplot(m3, aes(x = log2FoldChange, y = -log10(padj), label=zebrafish_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CCSER1_M vs CCSER1_S") + geom_text_repel(data = m3, size = 3) + theme_ipsum()
+
+```
+
+
+
+```{r}
+
+#look for the genes found in the BP enrichment of cluster 2, BP term 2 (in this case axon development)
+set = as.data.frame(ensembl.genes[ensembl.genes$zfin_id_symbol %in% strsplit(bp2$data$geneID[2], "/")[[1]], ])
+
+
+#S vs WT
+d1 = S_vs_WT_d[S_vs_WT_d$name %in% set$gene_id, ]
+ggplot(S_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "dodgerblue") + labs(title = "Volcano, CCSER1_S vs WT") + geom_point(data = d1, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d1, size = 3) + theme_ipsum()
+
+m1 = merge(set, d1, by.x = 6, by.y = 7)
+
+ggplot(m1, aes(x = log2FoldChange, y = -log10(padj), label=zfin_id_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CCSER1_S vs WT") + geom_point(data = m1[m1$padj < 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="firebrick2") + geom_point(data = m1[m1$padj >= 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = m1, size = 3) + theme_ipsum()
+
+
+#M vs WT
+d2 = M_vs_WT_d[M_vs_WT_d$name %in% set$gene_id, ]
+ggplot(M_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "seagreen") + labs(title = "Volcano, CCSER1_M vs WT") + geom_point(data = d2, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d2, size = 3) + theme_ipsum()
+
+m2 = merge(set, d2, by.x = 6, by.y = 7)
+
+ggplot(m2, aes(x = log2FoldChange, y = -log10(padj), label=zfin_id_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CCSER1_M vs WT") + geom_point(data = m2[m2$padj < 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="firebrick2") + geom_point(data = m2[m2$padj >= 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = m2, size = 3) + theme_ipsum()
+
+
+
+```
+
+
+
+
+
+
+
+
+
+### KEGG pathway expression
+
+
+#### KEGG pathway enrichment (ORA)
+
+```{r}
+#S vs WT
+swt_sig = S_vs_WT[S_vs_WT$padj < 0.01,]
+kegg_swt = enrichKEGG(gene          = as.character(ensembl.genes[ensembl.genes$gene_id %in% rownames(swt_sig)]$entrezgene_id),
+              universe      = as.character(ensembl.genes[ensembl.genes$gene_id %in% rownames(dds)]$entrezgene_id),
+              organism         = "dre",
+              qvalueCutoff  = 0.1)
+
+dotplot(kegg_swt, title = "KEGG Enrichment of CSSER1_S vs WT", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+head(kegg_swt@result[,c(1,2,6)])
+
+#M vs WT
+mwt_sig = M_vs_WT[M_vs_WT$padj < 0.01,]
+kegg_mwt = enrichKEGG(gene          = as.character(ensembl.genes[ensembl.genes$gene_id %in% rownames(mwt_sig)]$entrezgene_id),
+              universe      = as.character(ensembl.genes[ensembl.genes$gene_id %in% rownames(dds)]$entrezgene_id),
+              organism         = "dre",
+              qvalueCutoff  = 0.1)
+
+dotplot(kegg_mwt, title = "KEGG Enrichment of CSSER1_M vs WT", font.size = 10) + scale_y_discrete(labels=function(x) str_wrap(x, width=40)) + scale_color_gradient(high = "#003f5c", low = "#ffa600") + theme(axis.text.y = element_text(size=12), axis.text.x = element_text(size=12))
+
+kegg_mwt@result[,c(1,2,6)]
+head(kegg_mwt@result[,c(1,2,6)])
+
+
+
+```
+
+
+
+### KEGG enrichment (GSEA/FCS)
+
+```{r}
+collection = "C2"
+subcat = "CP:KEGG"
+d_df = msigdbr(species = "Danio rerio", category = collection, subcategory = subcat)
+#length(unique(m_df$gs_name))# number of genesets
+fgsea_sets = d_df %>% split(x = .$ensembl_gene, f = .$gs_name) 
+
+
+#SWT
+changes = S_vs_WT
+
+ensembl_sub = ensembl.genes[ensembl.genes$gene_id %in% row.names(changes), ] #subset annotation according to overlap
+changes_sub = changes[row.names(changes) %in% ensembl.genes$gene_id, ] #subset change data according to overlap
+
+changes_sub = changes_sub[order(row.names(changes_sub)),] #ensure genes are in same order as annotation
+sum(ensembl_sub$gene_id == row.names(changes_sub)) #are all gene ids identical?
+
+ensembl_sub$log2FoldChange = changes_sub$log2FoldChange #get corresponding foldchanges
+
+#create vector of fold changes to be ranked by lfc
+ensembl_sub_lfc = ensembl_sub$log2FoldChange
+names(ensembl_sub_lfc) = ensembl_sub$gene_id
+
+#order by lfc
+ensembl_sub_lfc = ensembl_sub_lfc[order(ensembl_sub_lfc, decreasing = T)]
+#filter for protein coding genes
+ensembl_sub_lfc = ensembl_sub_lfc[names(ensembl_sub_lfc) %in% ensembl_sub$gene_id[ensembl_sub$gene_biotype=="protein_coding"]]
+#run gsea
+fgseaRes <- fgseaMultilevel(pathways = fgsea_sets, 
+                  stats = ensembl_sub_lfc,
+                  minSize = 1,
+                  maxSize = 500,
+                  eps = 0)
+
+#top 10 most significant by padj
+fgseaRes[head(order(padj), n=10), ]
+```
+
+```{r}
+topPathwaysUp <- fgseaRes[ES > 0][head(order(padj), n=10), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(fgsea_sets[topPathways], ensembl_sub_lfc, fgseaRes, gseaParam = 0.5, render = T)
+```
+
+
+
+##### Automatic pathway selection (CSSER1_S vs WT)
+```{r, eval = F}
+library(pathview)
+library(KEGGREST)
+#also need stringr
+
+#s vs wt
+swt_l2fc = S_vs_WT$log2FoldChange
+names(swt_l2fc) = rownames(S_vs_WT)
+
+#list of gsea enrichments
+n = fgseaRes[head(order(padj), n=10), 1]
+#this is where you could add criteria for selection of pathways (i.e. padj or nes)
+
+
+for (i in 1:nrow(n)) {
+  n1 = n[i]
+  n1 = gsub("_", " ", str_sub(n1, 6, nchar(n1)))
+  t1 = names(keggFind("pathway", n1)[1])
+  t1 = str_sub(t1, 9, nchar(t1))
+  pv.out = pathview(gene.data = swt_l2fc, gene.idtype = "ENSEMBL", pathway.id = t1, species = "dre", out.suffix = "SWT", kegg.native = T, split.group = F, expand.node = F, low = "dodgerblue2", mid = "gray", high = "firebrick2")
+}
+
+
+```
+
+
+
+
+
+```{r}
+#MWT
+changes = M_vs_WT
+
+ensembl_sub = ensembl.genes[ensembl.genes$gene_id %in% row.names(changes), ] #subset annotation according to overlap
+changes_sub = changes[row.names(changes) %in% ensembl.genes$gene_id, ] #subset change data according to overlap
+
+changes_sub = changes_sub[order(row.names(changes_sub)),] #ensure genes are in same order as annotation
+sum(ensembl_sub$gene_id == row.names(changes_sub)) #are all gene ids identical?
+
+ensembl_sub$log2FoldChange = changes_sub$log2FoldChange #get corresponding foldchanges
+
+#create vector of fold changes to be ranked by lfc
+ensembl_sub_lfc = ensembl_sub$log2FoldChange
+names(ensembl_sub_lfc) = ensembl_sub$gene_id
+
+#order by lfc
+ensembl_sub_lfc = ensembl_sub_lfc[order(ensembl_sub_lfc, decreasing = T)]
+#filter for protein coding genes
+ensembl_sub_lfc = ensembl_sub_lfc[names(ensembl_sub_lfc) %in% ensembl_sub$gene_id[ensembl_sub$gene_biotype=="protein_coding"]]
+#run gsea
+fgseaRes <- fgseaMultilevel(pathways = fgsea_sets, 
+                  stats = ensembl_sub_lfc,
+                  minSize = 1,
+                  maxSize = 500,
+                  eps = 0)
+
+#top 10 most significant by padj
+fgseaRes[head(order(padj), n=10), ]
+
+```
+
+
+```{r}
+topPathwaysUp <- fgseaRes[ES > 0][head(order(padj), n=10), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(fgsea_sets[topPathways], ensembl_sub_lfc, fgseaRes, gseaParam = 0.5, render = T)
+```
+
+##### Automatic pathway selection (CSSER1_M vs WT)
+```{r, eval = F}
+library(pathview)
+library(KEGGREST)
+
+#m vs wt
+mwt_l2fc = M_vs_WT$log2FoldChange
+names(mwt_l2fc) = rownames(M_vs_WT)
+
+#list of gsea enrichments
+n = fgseaRes[head(order(padj), n=10), 1]
+#this is where you could add criteria for selection of pathways (i.e. padj or nes)
+
+
+for (i in 1:nrow(n)) {
+  n1 = n[i]
+  n1 = gsub("_", " ", str_sub(n1, 6, nchar(n1)))
+  t1 = names(keggFind("pathway", n1)[1])
+  t1 = str_sub(t1, 9, nchar(t1))
+  pv.out = pathview(gene.data = mwt_l2fc, gene.idtype = "ENSEMBL", pathway.id = t1, species = "dre", out.suffix = "MWT", kegg.native = T, split.group = F, expand.node = F, low = "dodgerblue2", mid = "gray", high = "firebrick2")
+}
+
+
+```
+
+
+##### Manual pathway selection
+```{r, eval=F}
+library(pathview)
+library(KEGGREST)
+
+#s vs wt
+swt_l2fc = S_vs_WT$log2FoldChange
+names(swt_l2fc) = rownames(S_vs_WT)
+
+#need a vector of l2fc with rownames as gene IDs
+#function automatically scales expression to -1:1, so don't need to zscore or normalize prior
+pv.out = pathview(gene.data = swt_l2fc, gene.idtype = "ENSEMBL", pathway.id = "04010", species = "dre", out.suffix = "SWT", kegg.native = T, split.group = F, expand.node = F, low = "dodgerblue2", mid = "gray", high = "firebrick2")
+
+
+#m vs wt
+mwt_l2fc = M_vs_WT$log2FoldChange
+names(mwt_l2fc) = rownames(M_vs_WT)
+
+pv.out = pathview(gene.data = mwt_l2fc, gene.idtype = "ENSEMBL", pathway.id = "04010", species = "dre", out.suffix = "MWT", kegg.native = T, split.group = F, expand.node = F, low = "dodgerblue2", mid = "gray", high = "firebrick2")
+
+
+```
+
+
+### Motif enrichment using MEMESUITE's AME
+
+Do gene sets have a shared method of regulation?
+```{r}
+set.seed(123)
+library(rtracklayer)
+library(memes)
+library(BSgenome) #need this, NOT just biostrings to make getseq() work correctly
+check_meme_install() #need local install of memesuite
+
+
+#we can start by reading in the ensembl genome, skipping ucsc entirely
+zfish = readDNAStringSet("Danio_rerio.GRCz11.dna.primary_assembly.fa")
+
+#choose cluster number for motif enrichment#
+k = 2
+
+cluster = names(results.coef.kmeans$cluster[results.coef.kmeans$cluster==k])
+c = ensembl.genes[ensembl.genes$gene_id %in% cluster,]
+
+length(c) == length(results.coef.kmeans$cluster[results.coef.kmeans$cluster==k])
+#the annotation subset is not the total number of genes in cluster1. thats already not ideal.
+#I suppose that's because I didn't fully annotate the genes before the analysis. Anyway, we can prove this part without that, but it's something to keep in mind.
+
+background = names(results.coef.kmeans$cluster[results.coef.kmeans$cluster!=k])
+bkg = ensembl.genes[ensembl.genes$gene_id %in% background,]
+
+#this is the aim, getting sequence data for genes of interest. the issue is that the chromosome number associated with the gene is different from the one being fed in from the sequence data in names. for the genes, it is just a number.
+
+
+#test case
+# strsplit("1 dna:chromosome chromosome:GRCz11:1:1:59578282:1 REF", " ")[[1]]
+
+#this adjusts the sequence chromosome names to match the gene chromosome names
+names(zfish) = sapply(strsplit(names(zfish), " "), "[[", 1) 
+
+#c1_seq = getSeq(zfish, c1) #these are the gene sequences themselves
+
+c_prom = getPromoterSeq(c, zfish, 250, 250) 
+
+bkg_prom = getPromoterSeq(bkg, zfish, 250, 250)
+
+
+ame = runAme(input = c_prom, control = bkg_prom, hit_lo_fraction = 0.5, database = "/Users/raunakvijayakar/Documents/RAUNAK/YNC/2021-2022/Capstone/RNAseq/CCSER1/BODY/JASPAR2020_CORE_vertebrates_non-redundant_pfms_meme.txt")
+
+head(ame)
+
+#add BH adjusted pvalues (FDR)
+ame$p.bh = p.adjust(ame$pvalue, method = "BH")
+#just in case for plotting
+ame$logp.bh = -log10(ame$p.bh)
+
+#add fp/tp ratio
+ame$ratio = ame$tp_percent/ame$fp_percent
+
+#this massively reduces the search space based on tp/fp. is it a valid move? I'm not really sure. the rules here are sparse.
+ame[ame$ratio >= 2, 4]
+
+```
+
+
+#### Plotting TFs
+```{r}
+
+tfs = ame$motif_alt_id
+#conversion using objects from custom gsea
+# s1 = c("HOXA1","HOXA10","HOXA2")
+o1 = lookup[lookup$human_symbol %in% tfs, c(5,9,12)]
+o1 = o1[nchar(o1$zebrafish_ensembl_gene) == 18, ]
+
+length(tfs)
+length(unique(o1$human_symbol))
+
+
+d1 = M_vs_WT_d[M_vs_WT_d$name %in% o1$zebrafish_ensembl_gene, ]
+
+ggplot(M_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "dodgerblue") + labs(title = "Volcano, CSSER1_M vs WT") + geom_point(data = d1, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d1, size = 3) + theme_ipsum() + ylim(0,50)
+
+m1 = merge(o1, d1, by.x = 2, by.y = 7)
+m1 = m1 %>% distinct(zebrafish_symbol, .keep_all = T)
+
+ggplot(m1, aes(x = log2FoldChange, y = -log10(padj), label=zebrafish_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CSSER1_M vs WT") + geom_point(data = m1[m1$padj < 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="firebrick2") + geom_point(data = m1[m1$padj >= 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = m1, size = 3) + theme_ipsum()
+
+#m1 shows the set of TFs expressed in our data. it is likely even more restrictive than that, since it is limited to ones we could translate from the ame output (which was mostly HUGO ids) to zfish, using hcop.
+head(m1)
+```
+
+
+#### Top TFs 
+```{r}
+#filtering tf enrichment based on tp/fp ratios
+tf_top = ame[ame$ratio >= 2, ]
+
+# ggplot(data = tf_top, aes(motif_alt_id, logp.bh)) + geom_col()
+
+#search for top terms in expression data, using results from plotting
+tf_top_exp = unique(m1[m1$human_symbol %in% tf_top$motif_alt_id, 2] )
+tf_top_exp
+
+#filter results based on expression
+tf_top_2 = tf_top[tf_top$motif_alt_id %in% tf_top_exp, ]
+
+#builtin plotting
+tf_top_2$group = paste("Cluster", k)
+tfp = plot_ame_heatmap(tf_top_2, id = motif_alt_id, value = logp.bh, group = group)
+tfp$labels$fill = "-log10(FDR)"
+tfp$labels$x = "Symbol"
+tfp
+
+```
+
+
+
+#### Plotting top TFs
+```{r}
+
+tfs = tf_top_2$motif_alt_id
+#conversion using objects from custom gsea
+# s1 = c("HOXA1","HOXA10","HOXA2")
+o1 = lookup[lookup$human_symbol %in% tfs, c(5,9,12)]
+o1 = o1[nchar(o1$zebrafish_ensembl_gene) == 18, ]
+
+length(tfs)
+length(unique(o1$human_symbol))
+
+
+d1 = M_vs_WT_d[M_vs_WT_d$name %in% o1$zebrafish_ensembl_gene, ]
+
+ggplot(M_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "dodgerblue") + labs(title = "Volcano, CCSER1_M vs WT") + geom_point(data = d1, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d1, size = 3) + theme_ipsum() + ylim(0,50)
+
+m1 = merge(o1, d1, by.x = 2, by.y = 7)
+m1 = m1 %>% distinct(zebrafish_symbol, .keep_all = T)
+
+ggplot(m1, aes(x = log2FoldChange, y = -log10(padj), label=zebrafish_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CCSER1_M vs WT") + geom_point(data = m1[m1$padj < 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="firebrick2") + geom_point(data = m1[m1$padj >= 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = m1, size = 3) + theme_ipsum()
+
+#this is how I can report on the significant DE tfs, using their human names rather than the numerous orthologs
+unique(m1[m1$padj < 0.01, 2])
+m1[m1$padj < 0.01, ]
+
+####
+d1 = S_vs_WT_d[S_vs_WT_d$name %in% o1$zebrafish_ensembl_gene, ]
+
+ggplot(S_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "dodgerblue") + labs(title = "Volcano, CCSER1_S vs WT") + geom_point(data = d1, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d1, size = 3) + theme_ipsum() + ylim(0,50)
+
+m1 = merge(o1, d1, by.x = 2, by.y = 7)
+m1 = m1 %>% distinct(zebrafish_symbol, .keep_all = T)
+
+ggplot(m1, aes(x = log2FoldChange, y = -log10(padj), label=zebrafish_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CCSER1_S vs WT") + geom_point(data = m1[m1$padj < 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="firebrick2") + geom_point(data = m1[m1$padj >= 0.01,], aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = m1, size = 3) + theme_ipsum()
+
+#this is how I can report on the significant DE tfs, using their human names rather than the numerous orthologs
+unique(m1[m1$padj < 0.01, 2])
+m1[m1$padj < 0.01, ]
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+tf_plot = as.matrix(c(tf_top_2$logp.bh))
+row.names(tf_plot) = tf_top_2$motif_alt_id
+
+color = colorRampPalette(c("white", "firebrick2"))(28)
+breaksList = seq(0, max(tf_plot), length.out = 29)
+
+pheatmap(tf_plot, cluster_rows = F, cluster_cols = F, show_rownames = T, breaks = breaksList, color = color, legend = T, main = paste("Cluster",k,"top transcription factor motifs, -log10(FDR)"))
+
+```
+
+
+```{r}
+#this plot needs to be updated if the data change at all, but it's the only way to get the legend title. Maybe just use for publication figures
+pheatmap(tf_plot, cluster_rows = F, cluster_cols = F, show_rownames = T, breaks = breaksList, color = color, legend = T, main = paste("Cluster",k,"top transcription factor motifs"), legend_breaks = c(0, 5, 10, 15, 20, max(tf_plot)), legend_labels = c("0", "5", "10", "15", "20", "-log10(FDR)\n") )
+
+```
+
+
+
+#### WIP
+``` {r, eval = F}
+o1 = lookup[lookup$human_symbol %in% tf_top$motif_alt_id, c(5,9,12)] #problem!
+o1 = o1[nchar(o1$zebrafish_ensembl_gene) == 18, ]
+
+length(tfs)
+length(unique(o1$human_symbol))
+
+
+d1 = M_vs_WT_d[M_vs_WT_d$name %in% o1$zebrafish_ensembl_gene, ]
+
+ggplot(M_vs_WT_d, aes(x = log2FoldChange, y = -log10(padj), label=name)) + geom_point(alpha = 0.5, color = "dodgerblue") + labs(title = "Volcano, CSSER1_M vs WT") + geom_point(data = d1, aes(x = log2FoldChange, y = -log10(padj)), color="black") + geom_text_repel(data = d1, size = 3) + theme_ipsum() + ylim(0,50)
+
+m1 = merge(o1, d1, by.x = 2, by.y = 7)
+m1 = m1 %>% distinct(zebrafish_symbol, .keep_all = T)
+
+ggplot(m1, aes(x = log2FoldChange, y = -log10(padj), label=zebrafish_symbol)) + geom_point(color = "black") + labs(title = "Volcano, CSSER1_M vs WT") + geom_text_repel(data = m1, size = 3) + theme_ipsum()
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+### END
+
+
+
+
+
