@@ -4,3 +4,13 @@
 .Ruserdata
 
 .DS_Store
+*.RDS
+
+# Quarto html
+*.css
+*.woff
+*.js
+
+# Big files
+
+CCSER1/BODY/data/annotations/*

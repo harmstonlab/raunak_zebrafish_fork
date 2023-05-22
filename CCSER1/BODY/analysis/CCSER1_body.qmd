@@ -1,12 +1,26 @@
 ---
-title: "CCSER1_Body"
-author: "Raunak Vijayakar"
-date: "dd/mm/yyyy"
-output: 
-  html_document:
-    toc: TRUE
-    toc_float: TRUE
+title: 01_QC
+author: Qian Hui TAN
+date: '`r format(Sys.time(), "%d %B %Y")`'
+format:
+  html: 
+    keep-md: true
+    embed-resources: true
+    df-print: kable
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    number-sections: true
+    smooth-scroll: true
+    code-tools: true
+    code-line-numbers: true
+  gfm: 
+    df-print: kable
+    toc: true 
+    toc-depth: 3
+    number-sections: true
 ---
+
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
@@ -21,16 +35,50 @@ CCSER1_S indicates a nonsense mutation (STOP codon) in the gene, and CCSER1_M in
 
 ### Raw counts and annotation
 Must delete the first column's name in the txt count data to ensure we import gene names as rownames.
+
 ```{r}
 suppressPackageStartupMessages({
-  library(BiocManager)
   library(biomaRt) #biocmanager install
   library(DESeq2) #biocmanager install.  
   library(GenomicFeatures) #biocmanager install.  
+  library(GOplot)
+  library(tidyverse)
+  library(scales)
+  library(pheatmap)
+  library(ggrepel)
+  library(hrbrthemes)
+  library(clusterProfiler) #biocmanager install.  
+  library(org.Dr.eg.db) #biocmanager install.  
+  library(stringr)
+  library(ggplot2)
+  library(cluster)
+  library(fgsea) #biocmanager install
+  library(msigdbr)
+  library(dplyr)
+  library(gridExtra)
+  library(pathview)
+  library(KEGGREST)
+  library(rtracklayer)
+  library(memes)
+  library(BSgenome) #need this, NOT just biostrings to make getseq() work correctly
+
 })
 
+check_meme_install() #need local install of memesuite
+```
 
-body = read.delim("rawCounts_Body.txt", sep = "")
+```{r}
+output_dir <- "../output/"
+```
+
+
+Read in data: 
+```{r}
+body = read.delim("../data/rawCounts_Body.txt", sep = "")
+
+# Make gene names as rownames
+rownames(body) <- body$X
+body <- body[ ,-1]
 
 #exclude any rows where no counts were found for any condition
 body = body[rowSums(body) > 0, ]
@@ -38,13 +86,22 @@ body = body[rowSums(body) > 0, ]
 #take a look at the reads for each condition
 barplot(colSums(body), ylab="Number of aligned reads", las=2, cex.names=0.8)
 #numbers are similar across all samples
+```
 
+```{r}
+#| eval: FALSE
 
+# Run only once
 #get matching annotations
-dr.gtf.db <- makeTxDbFromGFF("Danio_rerio.GRCz11.102.chr.gtf", format="gtf")
+dr.gtf.db <- makeTxDbFromGFF("../data/annotations/Danio_rerio.GRCz11.102.chr.gtf.gz", format="gtf")
 ensembl.genes = genes(dr.gtf.db)
-fish = useEnsembl(biomart="ENSEMBL_MART_ENSEMBL", host = "asia.ensembl.org", dataset="drerio_gene_ensembl", version = "102") #change host as needed
-head(listAttributes(fish))#annotations we can request
+
+fish = useEnsembl(biomart = "ENSEMBL_MART_ENSEMBL", 
+                  host = "asia.ensembl.org", 
+                  dataset = "drerio_gene_ensembl", 
+                  version = "102") #change host as needed
+
+#head(listAttributes(fish))#annotations we can request
 
 bm.annotations = getBM(attributes=c("ensembl_gene_id", "entrezgene_id", "gene_biotype", "description", "zfin_id_symbol"), mart=fish, filters="ensembl_gene_id", values=ensembl.genes$gene_id, uniqueRows=TRUE)
 
@@ -53,7 +110,14 @@ ensembl.genes$gene_biotype = bm.annotations$gene_biotype[ match(ensembl.genes$ge
 ensembl.genes$status = bm.annotations$status[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
 ensembl.genes$description = bm.annotations$description[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
 ensembl.genes$entrezgene_id = bm.annotations$entrezgene_id[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+
+saveRDS(ensembl.genes, file = "../output/ensembl.genes.RDS")
 ```
+
+```{r}
+ensembl.genes <- readRDS("../output/ensembl.genes.RDS")
+```
+
 
 After reading in the quantified data as read counts, filter out any genes that are not expressed in any sample.Check the read depth of each sample with a barplot. Read depth is quite consistent in this data. Find annotations corresponding to each gene.
 
@@ -65,22 +129,53 @@ After reading in the quantified data as read counts, filter out any genes that a
 #see how many reads are in rRNA/mtRNA
 rrna = names(ensembl.genes[ensembl.genes$gene_biotype %in% c("Mt_rRNA", "rRNA" )])
 total.rrna = colSums(body[row.names(body) %in% rrna,])
+
 barplot(100 * (total.rrna / colSums(body)), ylab="%rRNA/mtRNA", las=2, cex.names=0.8)
 
 #how many reads are in mitochondrial chromosome?
 chrM = names(ensembl.genes[ensembl.genes@seqnames %in% "MT", ])
 total.mchrom = colSums(body[row.names(body) %in% chrM,])
 barplot(100 * (total.mchrom / colSums(body)), ylab="%MT", las=2, cex.names=0.8)
-
-
+```
+```{r}
 #remove rRNA and mtRNA
 body = body[!(row.names(body) %in% rrna),]
 # #remove mitochondrial chromosome reads
 # body = body[!(row.names(body) %in% chrM),]
 body[row.names(body) %in% "ENSDARG00000080031",]
+```
 
-met = read.csv("body_metadata.csv") #sample ids and conditions. no batch indicator, so we won't be controlling for that.
+Create the DESeq object
 
+Raunak's original code reads in a body_metadata.csv file, but I can't find it. We create it manually. 
+```{r}
+#met = read.csv("body_metadata.csv") #sample ids and conditions. no batch indicator, so we won't be controlling for that.
+```
+
+
+```{r}
+df <- tibble(sample_id = colnames(body))
+
+# WT metadata
+df_wt <- df[grep("WT", df$sample_id),] %>% 
+  separate(sample_id, into = c("condition", "part", "replicate"),
+           remove = FALSE)
+
+
+# non WT metadata
+df_ccser1 <- df[grep("CCSER1", df$sample_id),] %>% 
+  separate(sample_id, into = c("gene", "mutant_type", "part", "replicate"),
+           remove = FALSE) %>% 
+  unite(col = "condition", gene:mutant_type)
+
+# combine 
+met <- rbind(df_wt, df_ccser1)
+
+head(met)
+```
+
+
+```{r}
 dds = DESeqDataSetFromMatrix(body, met, ~ condition)
 
 dds
@@ -89,22 +184,20 @@ dds <- estimateSizeFactors(dds)
 dds <- estimateDispersions(dds) #this helps us deal w/fact that we don't have 30 samples/condition
 
 #normalize for read depth
-head(counts(dds))
-head(counts(dds, normalized=TRUE)) #can do this because we called sizefactors b/f, these number can be compared directly, across condition, not across gene though
+#head(counts(dds))
+#head(counts(dds, normalized=TRUE)) #can do this because we called sizefactors b/f, these number can be compared directly, across condition, not across gene though
+```
 
+```{r}
 #only choosing genes that have a normalized mean expression across conditions >= 10. This removes lowly expressed genes that are hard to differentiate from noise. could also be done after examining p-value histogram of a significance test, comparing pre- and post-filtering.
 filter = apply(counts(dds, normalized=TRUE), 1, function(x){ mean(x) >= 10 })
 dds = dds[filter, ]
+
+nrow(dds)
 #19722 genes after filtering
 
 #apply regularized log transform. 
 rld <- rlog(dds)
-
-
-
-
-
-
 ```
 
 Check for rRNA, and mt rRNA. Ideally these reads will be filtered out during the sequencing process (using ribozero, etc.). The barplots show that the sequencing is already well depleted for both of these sources of noise, as the percentages for both are low. Regardless, remove any genes annotated to be either rRNA, or mtRNA. Filter out genes that are lowly expressed (mean expression < 10), and apply a regularized log transform for PCA, normalizing for library size and putting the count data on a log2 scale.
@@ -112,7 +205,6 @@ Check for rRNA, and mt rRNA. Ideally these reads will be filtered out during the
 ### Annotation issue [NOTE]
 ``` {r}
 nrow(body)-sum(ensembl.genes$gene_id %in% rownames(body))
-
 ```
 
 Somehow, some of the genes in the actual data are not in the annotation. The annotation is constructed from a GTF file. The most up to date version is 104, which I'm using (and which I used in my alignments). But CCSER1 data was aligned before, and it turns out they used version 102. Also, when I perform the same check on SMCHD1 data, there is no difference (i.e. all genes are found in the annotation). So that version difference looks to be the culprit.
@@ -125,8 +217,6 @@ UPDATE: Now it's running with the 102 gtf, and I still get the same issue. So I 
 plotPCA(rld, intgroup = c( "condition"))
 plotPCA(rld, intgroup = c( "sample_id"))
 #separates the conditions from each other, which is what we hope. There's large variance between replicates, but that's okay since the replicates cross conditions.
-
-
 ```
 Perform PCA to both visualize the high dimensional RNASeq data, and to see is samples are well separated. Much of the data variation can be explained by the expected biological variation between samples, as seen in the plots above. Samples are well separated along PC1, and cluster together well on that axis. On PC1 we can differentiate WT and CCSER1_x samples, and on PC2 we can differentiate all samples. 
 
@@ -183,14 +273,13 @@ anns = ensembl.genes[ensembl.genes$gene_id %in% row.names(all_cond), ]
 exps = all_cond[row.names(all_cond) %in% anns$gene_id, ]
 sum(row.names(exps) == anns$gene_id)
 comb = cbind(as.data.frame(exps), as.data.frame(anns))[,-(7:12)]
-write.csv(comb, "CCSER1_annotated_genes.csv")
+write.csv(comb, paste0(output_dir, "CCSER1_annotated_genes.csv"))
 ```
 
 
 #### Venn Diagram
 ```{r}
 #producing venn diagram of mutant deg overlap
-library(GOplot)
 
 m1sig = S_vs_WT[S_vs_WT$padj < 0.01, ]
 m2sig = M_vs_WT[M_vs_WT$padj < 0.01, ]
@@ -219,37 +308,37 @@ ggsave("body_venn.svg", height = 7, width = 8, units = "in")
 temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$A_only),]
 temp$trend = venn$table$A_only[order(row.names(venn$table$A_only)), 2]
 nrow(venn$table$A_only) == length(temp)
-write.csv(temp, "S_unique.csv")
+write.csv(temp, paste0(output_dir, "S_unique.csv"))
 
 temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$B_only),]
 temp$trend = venn$table$B_only[order(row.names(venn$table$B_only)), 2]
 nrow(venn$table$B_only) == length(temp)
-write.csv(temp, "M_unique.csv")
+write.csv(temp, paste0(output_dir, "M_unique.csv"))
 
 temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$C_only),]
 temp$trend = venn$table$C_only[order(row.names(venn$table$C_only)), 2]
 nrow(venn$table$C_only) == length(temp)
-write.csv(temp, "MvsS_unique.csv")
+write.csv(temp, paste0(output_dir, "MvsS_unique.csv"))
 
 temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$AB),]
 temp$trend = venn$table$AB[order(row.names(venn$table$AB)), 3]
 nrow(venn$table$AB) == length(temp)
-write.csv(temp, "S_M_intersect.csv")
+write.csv(temp, paste0(output_dir, "S_M_intersect.csv"))
 
 temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$BC),]
 temp$trend = venn$table$BC[order(row.names(venn$table$BC)), 3]
 nrow(venn$table$BC) == length(temp)
-write.csv(temp, "M_MvsS_intersect.csv")
+write.csv(temp, paste0(output_dir, "M_MvsS_intersect.csv"))
 
 temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$AC),]
 temp$trend = venn$table$AC[order(row.names(venn$table$AC)), 3]
 nrow(venn$table$AC) == length(temp)
-write.csv(temp, "S_MvsS_intersect.csv")
+write.csv(temp, paste0(output_dir, "S_MvsS_intersect.csv"))
 
 temp = ensembl.genes[ensembl.genes$gene_id %in% row.names(venn$table$ABC),]
 temp$trend = venn$table$ABC[order(row.names(venn$table$ABC)), 4]
 nrow(venn$table$ABC) == length(temp)
-write.csv(temp, "All_intersect.csv")
+write.csv(temp, paste0(output_dir, "All_intersect.csv"))
 
 
 #this one is proportionate and can be fully tweaked, and really requires it to look good
@@ -272,7 +361,7 @@ tmp = as.data.frame(m1sig)
 tmp = tmp[order(row.names(tmp), decreasing = F),]
 ann = as.data.frame(ensembl.genes[ensembl.genes$gene_id %in% row.names(tmp),1:5])
 tmp2 = cbind(ann, tmp)
-write.csv(tmp2, "S_vs_WT.csv")
+write.csv(tmp2, paste0(output_dir, "S_vs_WT.csv"))
 
 
 #M2_vs_WT
@@ -337,7 +426,6 @@ Negative log2fc for both mutants with respect to wild type. Not padj < 0.01 howe
 
 ### MA and volcano plots
 ```{r}
-library(scales)
 
 #S_vs_WT
 plot(S_vs_WT$log2FoldChange, -log10(S_vs_WT$padj), xlim = c(-15, 15), col = alpha("dodgerblue",0.5), main = "Volcano, CCSER1_S vs WT")
@@ -369,8 +457,6 @@ These plots also allow us to see if any changes are particularly significant or 
 
 #### Identifying specific genes from volcano plots
 ```{r}
-library(ggrepel)
-library(hrbrthemes)
 
 #S vs WT
 S_vs_WT_d = as.data.frame(S_vs_WT)
@@ -396,7 +482,6 @@ The conditions for gene labelling can be adjusted by applying different logic in
 
 ### Z-scoring fold changes
 ```{r}
-library(pheatmap)
 sig_results = all_cond[all_cond$padj < 0.01,] #the significantly differentially expressed genes from earlier
 
 #transform lfcs then z-score
@@ -418,7 +503,6 @@ rlg_z[rlg_z < -thr] = -thr
 ### K-means clustering
 ``` {r}
 #determine number of clusters
-library(cluster)
 
 #use wss to choose number of clusters
 set.seed(123)
@@ -488,10 +572,7 @@ write.csv(t3, "CCSER1_cluster1.csv")
 
 ### GO:BP enrichment of clusters
 ```{r}
-library(clusterProfiler) #biocmanager install.  
-library(org.Dr.eg.db) #biocmanager install.  
-library(stringr)
-library(ggplot2)
+
 
 bp = list()
 for (i in 1:nclust) {
@@ -752,10 +833,7 @@ write.csv(bpm$data, "terms_bp_swt.csv")
 
 ### Gene set enrichment analysis
 ``` {r}
-library(fgsea) #biocmanager install
-library(msigdbr)
-library(dplyr)
-library(gridExtra)
+
 
 #get gene sets
 #msigdbr_species()
@@ -1110,7 +1188,6 @@ fgseaResTidy %>% dplyr::select(-leadingEdge, -ES) %>% arrange(padj)
 Using a combination of the annotated volcano plot from earlier and custom gsea ortholog lookup method.
 
 ```{r}
-library(hrbrthemes)
 #conversion
 s1 = c("ATM","ATR")
 o1 = lookup[lookup$human_symbol %in% s1, c(5,9,12)]
@@ -1339,8 +1416,7 @@ plotGseaTable(fgsea_sets[topPathways], ensembl_sub_lfc, fgseaRes, gseaParam = 0.
 
 ##### Automatic pathway selection (CSSER1_S vs WT)
 ```{r, eval = F}
-library(pathview)
-library(KEGGREST)
+
 #also need stringr
 
 #s vs wt
@@ -1409,9 +1485,6 @@ plotGseaTable(fgsea_sets[topPathways], ensembl_sub_lfc, fgseaRes, gseaParam = 0.
 
 ##### Automatic pathway selection (CSSER1_M vs WT)
 ```{r, eval = F}
-library(pathview)
-library(KEGGREST)
-
 #m vs wt
 mwt_l2fc = M_vs_WT$log2FoldChange
 names(mwt_l2fc) = rownames(M_vs_WT)
@@ -1435,8 +1508,6 @@ for (i in 1:nrow(n)) {
 
 ##### Manual pathway selection
 ```{r, eval=F}
-library(pathview)
-library(KEGGREST)
 
 #s vs wt
 swt_l2fc = S_vs_WT$log2FoldChange
@@ -1462,10 +1533,7 @@ pv.out = pathview(gene.data = mwt_l2fc, gene.idtype = "ENSEMBL", pathway.id = "0
 Do gene sets have a shared method of regulation?
 ```{r}
 set.seed(123)
-library(rtracklayer)
-library(memes)
-library(BSgenome) #need this, NOT just biostrings to make getseq() work correctly
-check_meme_install() #need local install of memesuite
+
 
 
 #we can start by reading in the ensembl genome, skipping ucsc entirely

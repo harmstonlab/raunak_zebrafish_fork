@@ -1,0 +1,512 @@
+---
+title: 02_DE
+author: Qian Hui TAN
+date: '`r format(Sys.time(), "%d %B %Y")`'
+format:
+  html: 
+    keep-md: true
+    embed-resources: true
+    df-print: kable
+    toc: true
+    toc-depth: 4
+    code-fold: true
+    number-sections: true
+    smooth-scroll: true
+    code-tools: true
+    code-line-numbers: true
+  gfm: 
+    df-print: kable
+    toc: true 
+    toc-depth: 4
+    number-sections: true
+    prefer-html: true
+---
+
+# 02c_DE_MvsS
+
+In this notebook, we analyze how similar CCSER1_S and CCSER1_M are. We do this in two ways: 
+
+- Pairwise crossplot
+- Venn diagram 
+
+For convenience, we refer to CCSER1_M as M, and CCSER1_S as S. 
+
+In essence, we are asking: If a gene goes up in S, does it also go up in M? Do both M and S affect similar, or different pathways? 
+
+```{r}
+#| label = "setup",
+#| include = FALSE
+
+knitr::opts_chunk$set(fig.path='../figures/02_DE/',
+                      dev=c("png"))
+
+```
+
+# Setup
+
+```{r}
+source("../scripts/R/functions.R")
+source("../scripts/R/clustering_functions.R")
+source("../scripts/R/DE_functions.R")
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(GenomicFeatures)
+  library(RColorBrewer)
+  library(gplots)
+  library(biomaRt)
+  library(grid)
+  library(gridExtra)
+  library(ggplot2)
+  library(lattice)
+  library(reshape)
+  library(geneplotter)
+  library(ggrepel)
+  library(limma)
+  library(tidyverse)
+  library(eulerr)
+  library(gghighlight)
+  library(clusterProfiler)
+  library(org.Dr.eg.db)
+    # For GSEA
+  library(fgsea) #biocmanager install
+  library(msigdbr)
+  library(knitr)
+})
+```
+
+
+
+```{r}
+## If the output directory doesn't exist, create it
+if(!dir.exists("../output/02_DE")){
+  dir.create("../output/02_DE")
+}
+
+output_dir <- "../output/02_DE/"
+```
+
+## Function
+```{r}
+#| eval: FALSE
+highlight_reactome <- function(pathways,
+                               df_plot,
+                               subtitle = "subtitle",
+                               label = FALSE){
+
+  df_plot <- df_plot %>% 
+    mutate(signif = case_when(
+      pathway %in% pathways & M_padj < 0.1 & S_padj < 0.1 ~ "both_signif",
+      pathway %in% pathways & M_padj < 0.1 ~ "M_signif", 
+      pathway %in% pathways & S_padj < 0.1 ~ "S_signif",
+      pathway %in% pathways ~ "NS",
+      TRUE ~ "NA"
+    )
+    )
+  
+  df_plot$sig <- factor(df_plot$sig, 
+                             levels = c("both_signif",
+                                        "M_signif", "S_signif",
+                                        "NS", "NA"))
+  suppressWarnings(
+    print(ggplot(df_plot,
+         aes(x = S_nes, y = M_nes, color = sig)) +
+    geom_point(alpha = 0.6) +
+    geom_vline(xintercept = 0, color = "blue", linetype = "dashed") +
+    geom_hline(yintercept = 0, color = "blue", linetype = "dashed") +
+    gghighlight::gghighlight(sig %in% c("both_signif", "M_signif", "S_signif",
+                                        "NS"),
+                             use_direct_label = label,
+                             label_key = pathway) +
+    scale_color_manual(values = c("red", "forestgreen", "blue", "black", "grey50"),
+                       breaks = c("both_signif", "M_signif", "S_signif", "NS",
+                                  "NA")) +
+    scale_x_continuous(limits = c(-3, 3)) +
+    scale_y_continuous(limits = c(-3, 3)) +
+    labs(title = "Reactome enrichment scores",
+         subtitle = subtitle) +
+    coord_fixed() +
+    theme_light())
+    
+  )
+
+  df_plot <- df_plot %>% 
+    filter(pathway %in% pathways) %>% 
+    arrange(sig)
+  
+  return(df_plot)
+
+}
+
+```
+
+
+## DESeq
+
+```{r}
+#| label = "load data"
+
+dds = readRDS("../output/01_QC/dds_filt.RDS")
+ensembl.genes= readRDS("../output/01_QC/ensembl.genes.RDS")
+lfc.threshold = log2(1.5)
+
+#ls_gene <- read.csv("../output/01b_prep_genelist/matched_gene_list.csv")
+
+dim(dds)
+
+# Removing lowly expressed genes, only to be done once at the start of the differential expression step
+filter = apply(counts(dds, normalized = TRUE), 1, function(x){ mean(x) >= 10 })
+dds = dds[filter, ]
+dim(dds)
+
+dds <- DESeq(dds, test = "Wald", parallel = TRUE)
+rld <- rlog(dds, blind = FALSE) # blind = FALSE for downstream DE
+
+# Set WT as reference level
+colData(dds)$condition <- relevel(colData(dds)$condition, ref = "WT")
+
+design(dds) 
+```
+
+List of samples:
+```{r}
+colData(dds)$sample_id
+```
+
+Run Wald test
+```{r}
+#| message: FALSE
+wald_dds = nbinomWaldTest(dds)
+```
+
+Check names of coefficients
+```{r}
+resultsNames(wald_dds)
+```
+
+
+# Volcano Plots
+
+## S vs WT 
+```{r}
+#| label: S-WT-hist
+results_S_WT = get_dds_res(wald_dds, 
+                             contrast = c("condition", "CCSER1_S", "WT"),
+                             ensembl.genes, 
+                             shrink = TRUE)
+
+hist(results_S_WT$pvalue)
+```
+
+
+```{r}
+#| label: S-WT-vlc
+### Volcano plot
+generate_volcano(results_S_WT, "S", "WT")
+```
+
+
+
+
+## M vs WT 
+```{r}
+#| label: M-WT-hist
+results_M_WT = get_dds_res(wald_dds, 
+                             contrast = c("condition", "CCSER1_M", "WT"),
+                             ensembl.genes, 
+                             shrink = TRUE)
+
+hist(results_M_WT$pvalue)
+```
+
+
+```{r}
+#| label: M-WT-vlc
+### Volcano plot
+generate_volcano(results_M_WT, "M", "WT")
+```
+
+## Compile and export
+
+```{r}
+## Saving this to compile later
+
+compname <- "M_vs_WT"
+
+M_vs_WT <- results_M_WT[ ,c("baseMean", "log2FoldChange", "padj")]
+colnames(M_vs_WT) <- c(paste0(compname, "_baseMean"),
+                         paste0(compname, "_log2fc"), 
+                         paste0(compname, "_padj"))
+M_vs_WT$lfcShrink = TRUE
+
+
+compname <- "S_vs_WT"
+
+S_vs_WT <- results_S_WT[ ,c("baseMean", "log2FoldChange", "padj")]
+colnames(S_vs_WT) <- c(paste0(compname, "_baseMean"),
+                         paste0(compname, "_log2fc"), 
+                         paste0(compname, "_padj"))
+```
+
+Check that they have same number of rows: 
+```{r}
+nrow(M_vs_WT) == nrow(S_vs_WT)
+```
+
+
+```{r}
+df_compiled <- cbind(M_vs_WT, S_vs_WT)
+
+head(df_compiled)
+
+write.csv(df_compiled, file = paste0(output_dir, "master_de_list.csv"))
+```
+
+
+
+# Pairwise comparison plots
+
+How similar are M and S? In other words, if a gene goes up in M vs WT, does it also go up in S vs WT? 
+
+To answer this question, we use a pairwise crossplot. We plot **log2FoldChange(S vs WT)** on the x-axis, and the **log2FoldChange(M vs WT)** on the y-axis. 
+
+We can think of this as a 2D volcano plot, where one volcano plot is on the x axis while the other is on the y-axis. 
+
+This divides the plot into 4 quadrants:
+
+- Top right: Up in S, up in M
+- Bottom left: Down in S, down in M
+- Top left: Down in S, up in M
+- Bottom right: Up in S, down in M
+
+which correspond to downregulation and upregulation respectively. 
+
+
+## M-S-all
+
+```{r}
+#| label: pairwise-M-S-all
+
+### Note the order of S and WT - S here is the numerator, WT is the denominator
+c1_WT = results(wald_dds, contrast = c("condition", "CCSER1_S", "WT"),  
+                                filter=rowMeans(counts(wald_dds, normalized=TRUE)), 
+                                test="Wald", alpha=0.1, independentFiltering=TRUE)
+
+c1_WT <- lfcShrink(wald_dds, 
+                    coef = "condition_CCSER1_S_vs_WT", 
+                    res = c1_WT, 
+                    type = "apeglm", parallel = TRUE)
+
+c2_WT = results(wald_dds, contrast = c("condition", "CCSER1_M", "WT"),  
+                                filter=rowMeans(counts(wald_dds, normalized=TRUE)), 
+                                test="Wald", alpha=0.1, independentFiltering=TRUE)
+
+c2_WT <- lfcShrink(wald_dds, 
+                    coef = "condition_CCSER1_M_vs_WT", 
+                    res = c2_WT,
+                    type = "apeglm", parallel = TRUE)
+
+dat <- data.frame(
+  gene_id = rownames(c1_WT),
+  c1_vs_WT_fc = c1_WT$log2FoldChange, 
+  c1_vs_WT_padj = c1_WT$padj,
+  c2_vs_WT_fc = c2_WT$log2FoldChange,
+  c2_vs_WT_padj = c2_WT$padj)
+
+dat$gene_name = ensembl.genes$external_gene_name[match(dat$gene_id, ensembl.genes$gene_id)]
+
+# Plot
+ggplot(dat, aes(x = c1_vs_WT_fc, y = c2_vs_WT_fc, label = gene_id)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = lfc.threshold, color = "darkblue", linetype = "dashed") +
+  geom_hline(yintercept = -lfc.threshold, color = "darkblue", linetype = "dashed") +
+  geom_vline(xintercept = -lfc.threshold, color = "darkblue", linetype = "dashed") +
+  geom_vline(xintercept = lfc.threshold, color = "darkblue", linetype = "dashed") +
+  labs(title = "S vs M",
+       subtitle = "All genes",
+       x = "log2fc(S vs WT)", 
+       y = "log2fc(M vs WT)") +
+  scale_x_continuous(limits = c(-6, 6), breaks = c(-20, -3, -0.58, 
+                                                    0.58, 3, 20)) +
+  scale_y_continuous(limits = c(-6, 6), breaks = c(-20, -3, -0.58,
+                                                    0.58, 3, 20)) +
+  gghighlight::gghighlight(abs(c1_vs_WT_fc) > lfc.threshold & abs(c2_vs_WT_fc) > lfc.threshold,
+                           line_label_type = "ggrepel_label") +
+  theme_light() +
+  coord_fixed()
+
+```
+
+
+### Common (top right and bottom left quadrant)
+
+These two quadrants contain genes that are changing **similarly** in M and S. In other words, if this gene is upregulated in M, it is also upregulated in S.
+
+We keep only genes that have an absolute fold change of > 1.5 - in other words, the black dots in the top right and bottom left quadrant of the previous plot. For now, we will not implement any filtering based on `padj`. 
+
+:::{.panel-tabset}
+#### GO enrichments
+
+**Number of genes (without filtering for padj):**
+```{r}
+top_right <- dat[(dat$c1_vs_WT_fc) > lfc.threshold & (dat$c2_vs_WT_fc) > lfc.threshold, ]$gene_id
+bottom_left <- dat[(dat$c1_vs_WT_fc) < -lfc.threshold & (dat$c2_vs_WT_fc) < -lfc.threshold, ]$gene_id
+
+signif_genes <- c(top_right, bottom_left)
+
+common_signif <- signif_genes
+
+length(signif_genes)
+```
+
+**GO enrichment:**
+```{r}
+#| label: S-M-go
+ego <- plotEGO_dr(signif_genes, universe = rownames(dds), 
+               ont = "BP",
+               title = "GO, M and S common targets")
+```
+
+#### KEGG enrichments
+
+```{r}
+#| label: S-M-kegg
+
+# Plot
+ekegg <- plotKEGG_dr(get_entrez(ensembl_ids = signif_genes, 
+                                ensembl_genes = ensembl.genes),
+                     title = "KEGG, M and S common targets")
+
+# Table
+ekegg[ ,colnames(ekegg) %in% c("Description", "GeneRatio", "p.adjust", "geneID")]
+```
+
+#### Summary
+
+GO: M and S share some common targets - cell adhesion, IL-4, IL-17, epithelial cell proliferation and migration. 
+
+KEGG: Nothing
+
+:::
+
+## M-S-filt
+
+Filter and only keep genes that have padj < 0.1 in either comparisons 
+
+
+Filter and plot: 
+
+```{r}
+#| label: pairwise-M-S-filt
+
+# Keep only genes with padj < 0.1 in at least 1 comparison
+dat_filt <- na.omit(dat[dat$c1_vs_WT_padj < 0.1 & dat$c2_vs_WT_padj < 0.1, ])
+
+# Plot
+ggplot(dat_filt, aes(x = c1_vs_WT_fc, y = c2_vs_WT_fc, label = gene_id)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = lfc.threshold, color = "darkblue", linetype = "dashed") +
+  geom_hline(yintercept = -lfc.threshold, color = "darkblue", linetype = "dashed") +
+  geom_vline(xintercept = -lfc.threshold, color = "darkblue", linetype = "dashed") +
+  geom_vline(xintercept = lfc.threshold, color = "darkblue", linetype = "dashed") +
+  labs(title = "S vs M",
+       subtitle = "Filter: padj < 0.1",
+       x = "log2fc(S vs WT)", 
+       y = "log2fc(M vs WT)") +
+  scale_x_continuous(limits = c(-6, 6)) +
+  scale_y_continuous(limits = c(-6, 6)) +
+  gghighlight::gghighlight(abs(c1_vs_WT_fc) > lfc.threshold & abs(c2_vs_WT_fc) > lfc.threshold,
+                           line_label_type = "ggrepel_label") +
+  theme_light() +
+  coord_fixed()
+```
+
+# Venn diagram 
+
+- Among the genes that are significantly differently upregulated in M and S, how much overlap is there? 
+
+We define significance as abs(log2FC) > 1.5 AND padj < 0.1. 
+
+Wald test - M vs WT. How many genes are significant (padj < 0.1 & abs(foldChange) > 1.5)?
+```{r}
+### Note the order of M and WT - M here is the numerator, WT is the denominator
+res = results(wald_dds, contrast = c("condition", "CCSER1_M", "WT"),  
+                                filter=rowMeans(counts(wald_dds, normalized=TRUE)), 
+                                test="Wald", alpha=0.1, independentFiltering=TRUE)
+
+res = lfcShrink(wald_dds, 
+                coef = "condition_CCSER1_M_vs_WT", 
+                res = res, 
+                type = "apeglm", parallel = TRUE)
+
+
+res$gene_biotype= ensembl.genes$gene_biotype[match(row.names(res), ensembl.genes$gene_id)]
+res$external_gene_name= ensembl.genes$external_gene_name[match(row.names(res), ensembl.genes$gene_id)]
+
+M_signif <- res[na.omit(res$padj < 0.1 & abs(res$log2FoldChange) > lfc.threshold), ]
+
+dim(M_signif)
+```
+
+Wald test - S vs WT. How many genes are significant (padj < 0.1 & abs(foldChange) > 1.5)?
+```{r}
+### Note the order of S and WT - S here is the numerator, WT is the denominator
+res = results(wald_dds, contrast = c("condition", "CCSER1_S", "WT"),  
+                                filter=rowMeans(counts(wald_dds, normalized=TRUE)), 
+                                test="Wald", alpha=0.1, independentFiltering=TRUE)
+res = lfcShrink(wald_dds, 
+                coef = "condition_CCSER1_S_vs_WT", 
+                res = res, 
+                type = "apeglm", parallel = TRUE)
+res$gene_biotype= ensembl.genes$gene_biotype[match(row.names(res), ensembl.genes$gene_id)]
+res$external_gene_name= ensembl.genes$external_gene_name[match(row.names(res), ensembl.genes$gene_id)]
+
+S_signif <- res[na.omit(res$padj < 0.1 & abs(res$log2FoldChange) > lfc.threshold), ]
+
+dim(S_signif)
+```
+
+
+
+Venn diagram:
+
+```{r}
+genelist <- list("M" = rownames(M_signif), 
+                 "S" = rownames(S_signif))
+```
+
+```{r}
+#| label: venn-euler
+# An area-proportional plot
+plot(euler(genelist), quantities = TRUE)
+```
+
+
+
+Splitting this into up and down: 
+
+```{r}
+genelist_updown <- list("M_up" = rownames(M_signif[M_signif$log2FoldChange > lfc.threshold, ]), 
+                 "M_down" = rownames(M_signif[M_signif$log2FoldChange < -lfc.threshold, ]), 
+                 "S_up" = rownames(S_signif[S_signif$log2FoldChange > lfc.threshold, ]),
+                 "S_down" = rownames(S_signif[S_signif$log2FoldChange < -lfc.threshold, ]))
+```
+
+
+```{r}
+#| label: venn-euler-updown
+# An area-proportional plot
+plot(euler(genelist_updown), quantities = TRUE)
+```
+
+Export
+
+```{r}
+
+```
+
+
+
+```{r}
+sessionInfo()
+```
+
