@@ -167,6 +167,16 @@ colData(dds)$condition <- relevel(colData(dds)$condition, ref = "WT")
 design(dds) 
 ```
 
+
+Sanity check - do the rownames and sample_ids of colData match? 
+
+```{r}
+# This should be equal to the total number of samples (18)
+sum(rownames(colData(dds)) == colData(dds)$sample_id)
+
+```
+
+
 List of samples:
 ```{r}
 colData(dds)$sample_id

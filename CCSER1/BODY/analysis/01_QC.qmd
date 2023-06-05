@@ -185,26 +185,12 @@ experimental_metadata$condition <- factor(experimental_metadata$condition)
 experimental_metadata$condition <- relevel(experimental_metadata$condition, ref = "WT")
 ```
 
+DESeq needs the `data_mat` and `experimental_metadata` to be in the same order! Make sure this is the case. 
 
-## Create DESeq object
+Check that data_mat has the same order 
 
 ```{r}
-# Create DESeq object
-dds = DESeqDataSetFromMatrix(data_mat, experimental_metadata, ~ condition)
-colnames(dds) = colnames(data_mat)
-
-# Relevel coldata
-colData(dds)$condition <- as.factor(as.character(colData(dds)$condition))
-
-colnames(dds)
-
-
-#Estimates the size factors using the "median ratio method" described by Equation 5 in Anders and Huber (2010)
-dds <- estimateSizeFactors(dds) 
-#This function obtains dispersion estimates for a count data set
-dds <- estimateDispersions(dds)
-#This function transforms the count data to the log2 scale in a way which minimizes differences between samples for rows with small counts
-rld <- rlog(dds, blind = TRUE) # use blind = TRUE for QC
+data_mat <- data_mat[ ,experimental_metadata$sample_id]
 ```
 
 ```{r}
@@ -228,6 +214,38 @@ What percentage is this?
 ```{r}
 nrow(data_mat_nonzero)/nrow(data_mat) * 100
 ```
+
+## Create DESeq object
+
+```{r}
+# Create DESeq object
+dds = DESeqDataSetFromMatrix(data_mat_nonzero, experimental_metadata, ~ condition)
+colnames(dds) = colnames(data_mat_nonzero)
+
+# Relevel coldata
+colData(dds)$condition <- as.factor(as.character(colData(dds)$condition))
+
+colnames(dds)
+
+# Sanity check- make sure that rownames and sample ids for dds match
+
+if(all(rownames(colData(dds)) == colData(dds)$sample_id)){
+  print("Sample IDs and rownames match.")
+} else {
+  stop("Order of data_mat and experimental_metadata don't match. Please check the order.")
+}
+```
+
+
+```{r}
+#Estimates the size factors using the "median ratio method" described by Equation 5 in Anders and Huber (2010)
+dds <- estimateSizeFactors(dds) 
+#This function obtains dispersion estimates for a count data set
+dds <- estimateDispersions(dds)
+#This function transforms the count data to the log2 scale in a way which minimizes differences between samples for rows with small counts
+rld <- rlog(dds, blind = TRUE) # use blind = TRUE for QC
+```
+
 
 84% of all rows are nonzero.
 
